@@ -968,7 +968,7 @@ function Open-Navigator {
                 Write-Host "  N = Next       | B = Previous  | P = Pause/Play"
                 Write-Host "  S = Shuffle    | Q = View Queue | QQ = Navigate | F = Search"
                 Write-Host "  L = Toggle Loop (queue) | R = Toggle Repeat (current song)"
-                Write-Host "  + = Volume Up  | - = Volume Down"
+                Write-Host "  < / > = Seek -/+ 5s | + = Volume Up  | - = Volume Down"
                 Write-Host "  X = Exit"
                 Write-Host ""
                 return
@@ -1055,9 +1055,14 @@ function Play-Current {
     [WinMM]::mciSendString("play $global:Alias", $null, 0, [IntPtr]::Zero) | Out-Null
     $global:Paused = $false
     Set-Volume $global:Volume $true
+
+    $global:ArrowSteps = 0
+    Update-KeyBuffer
+    if ($rc -eq 0) { $global:SeekEnabled = $true }
 }
 
 function Stop-Current {
+    $global:SeekEnabled = $false
     if ($global:Alias) {
         [WinMM]::mciSendString("stop $global:Alias", $null, 0, [IntPtr]::Zero) | Out-Null
         [WinMM]::mciSendString("close $global:Alias", $null, 0, [IntPtr]::Zero) | Out-Null
@@ -1073,6 +1078,81 @@ function Toggle-Pause {
         [WinMM]::mciSendString("pause $global:Alias", $null, 0, [IntPtr]::Zero) | Out-Null
         $global:Paused = $true
     }
+}
+
+# ---------------------------------------------------------------------------
+# Key sorting and seeking
+# ---------------------------------------------------------------------------
+
+function Update-KeyBuffer {
+    while ([console]::KeyAvailable) {
+        $k = [console]::ReadKey($true).Key
+        if ($k -eq "LeftArrow")       { if ($global:SeekEnabled) { $global:ArrowSteps-- } }
+        elseif ($k -eq "RightArrow")  { if ($global:SeekEnabled) { $global:ArrowSteps++ } }
+        elseif ($global:ValidKeys -contains $k) { $global:LetterQueue.Enqueue([string]$k) }
+    }
+}
+
+
+function Get-PriorityKey {
+    Update-KeyBuffer
+
+    if ($global:LetterQueue.Count -gt 0) {
+        $global:ArrowSteps = 0
+        return $global:LetterQueue.Dequeue()
+    }
+
+    if ($global:SeekEnabled -and $global:ArrowSteps -ne 0) {
+        $steps = [math]::Max(-3, [math]::Min(3, $global:ArrowSteps))
+        $global:ArrowSteps    = 0
+        $global:PendingSeekMs = $steps * 5000
+        return "Seek"
+    }
+
+    $global:ArrowSteps = 0
+    return $null
+}
+
+function Seek-Relative {
+    param([int]$DeltaMs)
+
+    if (-not $global:Alias -or -not $global:SeekEnabled) { return }
+
+    if (-not $global:Paused) {
+        $mode = New-Object System.Text.StringBuilder 128
+        [WinMM]::mciSendString("status $global:Alias mode", $mode, 128, [IntPtr]::Zero) | Out-Null
+        if ($mode.ToString() -eq "stopped") { $global:SeekEnabled = $false; return }
+    }
+
+    $pos = Get-TrackPosition
+    $dur = Get-TrackDuration
+    if ($dur -le 0) { return }
+    if (-not $global:Paused -and $pos -ge ($dur - 1)) { $global:SeekEnabled = $false; return }
+
+    $target = [int][math]::Max(0, [math]::Min($dur - 1, $pos + $DeltaMs))
+
+    $err = $null
+    if ($global:Paused) {
+        [void][CoreAudioSessionVolume]::SetVolumeForProcess($PID, [single]0.0, 1, [ref]$err)
+    }
+
+    [WinMM]::mciSendString("seek $global:Alias to $target", $null, 0, [IntPtr]::Zero) | Out-Null
+    [WinMM]::mciSendString("play $global:Alias", $null, 0, [IntPtr]::Zero) | Out-Null
+
+    if ($global:Paused) {
+        [void][CoreAudioSessionVolume]::SetVolumeForProcess($PID, [single]0.0, 1, [ref]$err)
+        [WinMM]::mciSendString("pause $global:Alias", $null, 0, [IntPtr]::Zero) | Out-Null
+
+        Start-Sleep -Milliseconds 80
+        [void][CoreAudioSessionVolume]::SetVolumeForProcess($PID, [single]($global:Volume / 100.0), 3, [ref]$err)
+        Show-Progress
+        return
+    }
+
+    if ($target -ge ($dur - 1)) { $global:SeekEnabled = $false }
+
+    Set-Volume $global:Volume $true
+    Show-Progress
 }
 
 function Toggle-Loop {
@@ -1256,6 +1336,13 @@ $global:CursorIndex     = 0
 $global:LastPlayedIndex = 0
 $global:QueueOpen       = $false
 $global:PreSearchFile = $null
+$global:ValidKeys = @('N','B','P','S','Q','L','R','F','OemPlus','OemMinus','X')
+
+# Seek state
+$global:SeekEnabled   = $false
+$global:ArrowSteps    = 0
+$global:PendingSeekMs = 0
+$global:LetterQueue   = New-Object System.Collections.Queue
 
 Shuffle-Queue
 
@@ -1277,7 +1364,7 @@ Write-Host "Controls:"
 Write-Host "  N = Next       | B = Previous  | P = Pause/Play"
 Write-Host "  S = Shuffle    | Q = View Queue | QQ = Navigate | F = Search"
 Write-Host "  L = Toggle Loop (queue) | R = Toggle Repeat (current song)"
-Write-Host "  + = Volume Up  | - = Volume Down"
+Write-Host "  < / > = Seek -/+ 5s | + = Volume Up  | - = Volume Down"
 Write-Host "  X = Exit"
 Write-Host "  (Loop and Repeat are OFF by default.)"
 Write-Host ""
@@ -1288,8 +1375,8 @@ while ($global:Running) {
 
     if (-not $global:WaitingForLoop) { Show-Progress }
 
-    if (-not $global:WaitingForLoop -and [console]::KeyAvailable) {
-        $key = [console]::ReadKey($true).Key
+    $key = if (-not $global:WaitingForLoop) { Get-PriorityKey } else { $null }
+    if ($key) {
 
         if ($global:QueueOpen) {
             switch ($key) {
@@ -1305,9 +1392,6 @@ while ($global:Running) {
                         "B"        { Prev-Track }
                         "P"        { Toggle-Pause }
                         "S"        {
-
-
-
                             if ($global:SearchMode) { Exit-SearchMode }
                             Write-Host "`n  Shuffling..." -ForegroundColor Yellow
                             Stop-Current
@@ -1325,6 +1409,7 @@ while ($global:Running) {
                             Stop-Current
                             $global:Running = $false
                         }
+                        "Seek"      { Seek-Relative $global:PendingSeekMs }
                         "UpArrow"   { }
                         "DownArrow" { }
                     }
@@ -1337,9 +1422,6 @@ while ($global:Running) {
                 "B"        { Write-Host ""; Prev-Track }
                 "P"        { Toggle-Pause }
                 "S"        {
-
-
-
                     if ($global:SearchMode) { Exit-SearchMode }
                     Write-Host "`n  Shuffling..." -ForegroundColor Yellow
                     Stop-Current
@@ -1363,6 +1445,7 @@ while ($global:Running) {
                     Stop-Current
                     $global:Running = $false
                 }
+                "Seek"      { Seek-Relative $global:PendingSeekMs }
                 "UpArrow"   { }
                 "DownArrow" { }
             }
@@ -1375,6 +1458,8 @@ while ($global:Running) {
         [WinMM]::mciSendString("status $global:Alias mode", $status, 128, [IntPtr]::Zero) | Out-Null
 
         if ($status.ToString() -eq "stopped" -and -not $global:Paused) {
+            $global:SeekEnabled = $false
+
             if ($global:RepeatOne) {
                 $global:LastPlayedIndex = $global:Index
                 Stop-Current
