@@ -1,6 +1,6 @@
 # Windows PS1 Media Player CLI
 
-Most of us don’t like clicking buttons over and over again, especially on Windows when listening to music; sometimes we just want that Linux-like experience. This CLI music player serves that purpose.
+Most of us don’t like clicking buttons over and over again, especially on Windows when listening to music; sometimes we just want that Linux-like experience. This CLI application serves that purpose.
 
 Get your playlist shuffled and switch tracks with ease... enjoy your favorite music - uninterrupted and ad-free.
 
