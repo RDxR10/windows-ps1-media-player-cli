@@ -70,4 +70,4 @@ powershell -ep bypass -f .\play.ps1 <path to filename.ext>
 
 * 14-11-2026 [FEAT]: Left/Right arrow keys now seek ±5 seconds within the current track, whether it's playing or paused.
 
-* 15-11-2026 [FEAT]: Major rewrite: The music player has been extended into a media player, while retaining all existing music playback functionality and controls. The menu has also been reorganized into separate music and video sections.
+* 15-11-2026 [FEAT]: Major rewrite: The music player has been extended into a media player, while retaining all existing music playback functionality and controls. The menu has also been reorganized into separate music and video sections. Windows Core Audio volume control has been dropped.
