@@ -1665,7 +1665,7 @@ try {
         $psi = New-Object System.Diagnostics.ProcessStartInfo
         $psi.FileName = (Get-Process -Id $PID).Path
         $escapedTarget = $TargetPath.Replace('"', '\"')
-        $psi.Arguments = '-NoProfile -STA -ExecutionPolicy Bypass -File "' + $escapedTarget + '"'
+        $psi.Arguments = '-NoProfile -ExecutionPolicy Bypass -File "' + $escapedTarget + '"'
         $psi.UseShellExecute = $false
         # Keep stdout attached to the console so Clear-Host is exercised in a
         # normal console environment; only stdin is piped to select Exit.
@@ -1924,7 +1924,7 @@ else {
     [System.IO.File]::WriteAllText($csFile, $csSource)
     [System.IO.File]::WriteAllText($childFile, $childScript)
     $psExe = (Get-Process -Id $PID).Path
-    $childArgs = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-STA', '-File', $childFile, '-CsPath', $csFile, '-TargetPath', $ScriptPath)
+    $childArgs = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $childFile, '-CsPath', $csFile, '-TargetPath', $ScriptPath)
     if ($Integration) { $childArgs += '-Integration' }
     $childOut = @(& $psExe @childArgs 2>&1 | ForEach-Object { "$_" })
     $childExit = $LASTEXITCODE
