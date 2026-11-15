@@ -474,7 +474,7 @@ public class NativeMfPlayer
         Application.EnableVisualStyles();
 
         window = new Form();
-        window.Text = "Native Windows Video Player - " + Path.GetFileName(path);
+        window.Text = Path.GetFileName(path);
         window.Width = 1100;
         window.Height = 740;
         window.MinimumSize = new Size(650, 450);
