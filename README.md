@@ -28,7 +28,7 @@ powershell -ep bypass -f .\play.ps1 <path to filename.ext>
 
 ### Audio 
 
-- **Track Navigation:** Browse the music library and select tracks using arrow keys.
+- **Track Navigation:** Browse your library and select tracks using the arrow keys.
 - **Pause/Resume:** Pause and resume playback.
 - **Shuffle Queue:** Shuffle the playback queue.
 - **Search:** Search for tracks by name.
@@ -36,7 +36,7 @@ powershell -ep bypass -f .\play.ps1 <path to filename.ext>
 - **Notifications:** Playback notifications as and when tracks are played.
 - **Loop Mode:** Enable continuous playback.
 - **Auto Exit:** Automatically exit after a directly searched track finishes.
-- **Queue Management:** Search for tracks and add them to the queue without interrupting the current playback.
+- **Queue Management:** Search for tracks and add them to the queue without interrupting current playback while in Navigator View.
 - **Single Song Play/Lazy Play:** Pass a track name as an argument to play it directly. Partial name matching is supported.
 - **Seeking:** Seek forward and backward by 5 seconds using the Left/Right arrow keys, whether playback is active or paused.
 
