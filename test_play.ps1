@@ -1507,6 +1507,68 @@ try {
             [NativeMfAudioEngine]::Close()
             Need ([NativeMfAudioEngine]::GetState() -eq 0) 'not EMPTY after Close'
         }
+        # ---- Stress and reliability: native engine lifecycle -----------------
+        T 'Stress: repeated MFPlay open/play/stop/close cycles' {
+            try {
+                for ($i = 1; $i -le 8; $i++) {
+                    [NativeMfAudioEngine]::Open($wav)
+                    Need (Wait-State 2 8000) "cycle $i did not reach PLAYING"
+                    [NativeMfAudioEngine]::Stop(); Pump 40
+                    [NativeMfAudioEngine]::Close(); Pump 40
+                    Need ([NativeMfAudioEngine]::GetState() -eq 0) "cycle $i did not return to EMPTY"
+                }
+            }
+            finally { [NativeMfAudioEngine]::Close() }
+        }
+        T 'Stress: rapid playback controls and close tolerate callback activity' {
+            try {
+                for ($i = 1; $i -le 6; $i++) {
+                    [NativeMfAudioEngine]::Open($wav)
+                    Need (Wait-State 2 8000) "cycle $i did not reach PLAYING"
+                    # MFPlay callbacks are asynchronous; pump messages between
+                    # rapid state changes and verify cleanup after each sequence.
+                    [NativeMfAudioEngine]::Pause(); Pump 40
+                    [NativeMfAudioEngine]::Play(); Pump 40
+                    [NativeMfAudioEngine]::SetPositionMilliseconds(250); Pump 40
+                    [void][NativeMfAudioEngine]::SetVolume(65)
+                    [NativeMfAudioEngine]::Pause(); Pump 40
+                    [NativeMfAudioEngine]::Stop(); Pump 40
+                    [NativeMfAudioEngine]::Close(); Pump 100
+                    Need ([NativeMfAudioEngine]::GetState() -eq 0) "cycle $i left the engine outside EMPTY"
+                }
+            }
+            finally { [NativeMfAudioEngine]::Close() }
+        }
+        T 'Stress: repeated playback does not cause unbounded process resource growth' {
+            $proc = [Diagnostics.Process]::GetCurrentProcess()
+            try {
+                # Warm up MFPlay before taking the baseline so one-time startup
+                # allocations do not look like per-playback leaks.
+                for ($i = 1; $i -le 2; $i++) {
+                    [NativeMfAudioEngine]::Open($wav)
+                    Need (Wait-State 2 8000) "warm-up $i did not reach PLAYING"
+                    [NativeMfAudioEngine]::Close(); Pump 100
+                }
+                [GC]::Collect(); [GC]::WaitForPendingFinalizers(); [GC]::Collect()
+                Pump 200
+                $proc.Refresh()
+                $baseHandles = $proc.HandleCount
+                $basePrivate = $proc.PrivateMemorySize64
+                for ($i = 1; $i -le 10; $i++) {
+                    [NativeMfAudioEngine]::Open($wav)
+                    Need (Wait-State 2 8000) "cycle $i did not reach PLAYING"
+                    [NativeMfAudioEngine]::Close(); Pump 80
+                }
+                [GC]::Collect(); [GC]::WaitForPendingFinalizers(); [GC]::Collect()
+                Pump 200
+                $proc.Refresh()
+                $handleGrowth = $proc.HandleCount - $baseHandles
+                $privateGrowth = $proc.PrivateMemorySize64 - $basePrivate
+                Need ($handleGrowth -le 32) "process handle count grew by $handleGrowth (baseline $baseHandles)"
+                Need ($privateGrowth -le 67108864) "private memory grew by $([Math]::Round($privateGrowth / 1MB, 1)) MB"
+            }
+            finally { [NativeMfAudioEngine]::Close(); $proc.Dispose() }
+        }
         T 'MFPlay: an IEEE-float WAV is playable after conversion' {
             $fw = Join-Path $tmp 'float.wav'; $out = Join-Path $tmp 'float.pcm.wav'
             New-SineWav -Path $fw -Seconds 2 -Float
@@ -1956,3 +2018,4 @@ Say '----------------------------------------'
 
 if ($script:Failed -gt 0) { exit 1 }
 exit 0
+
