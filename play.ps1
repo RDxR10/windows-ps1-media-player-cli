@@ -8,9 +8,12 @@ $ErrorActionPreference = 'Stop'
 $MusicDir = $PSScriptRoot
 if ([string]::IsNullOrWhiteSpace($MusicDir)) { $MusicDir = (Get-Location).Path }
 
-$AudioExt = @('.mp3', '.wav', '.flac', '.m4a', '.aac', '.wma')
+$AudioExt = @('.mp3', '.wav', '.flac', '.m4a', '.aac', '.wma', '.ogg', '.aiff', '.aif')
 $VideoExt = @('.mp4', '.mkv', '.avi', '.mov', '.wmv', '.m4v')
 $AllExt   = $AudioExt + $VideoExt
+
+$global:CodecHintShown = $false
+$global:VideoTempDir   = Join-Path ([System.IO.Path]::GetTempPath()) ("play-ps1-video-" + $PID)
 $global:AudioDirectFile = $null
 
 Add-Type -AssemblyName System.Windows.Forms
@@ -18,6 +21,7 @@ Add-Type -AssemblyName System.Drawing
 
 $mfSource = @'
 using System;
+using System.Collections.Generic;
 using System.Runtime.InteropServices;
 using System.Windows.Forms;
 using System.Drawing;
@@ -213,6 +217,8 @@ public class NativeMfPlayer
     private bool fullscreen;
     private bool isPlaying = true;
     private bool hasPlayed;
+    private DateTime openedAt = DateTime.UtcNow;
+    private bool loadWarned;
 
     private FormBorderStyle previousBorder;
     private FormWindowState previousState;
@@ -446,6 +452,12 @@ public class NativeMfPlayer
             }
 
             currentTime.Text = FormatTime(position);
+
+            if (!hasPlayed && !loadWarned && durationTicks <= 0 && (DateTime.UtcNow - openedAt).TotalSeconds > 8)
+            {
+                loadWarned = true;
+                status.Text = "Unable to play this file - a compatible codec may be required.";
+            }
 
             // Detect end of playback (state STOPPED after having been PLAYING).
             int st;
@@ -768,8 +780,8 @@ public class NativeMfPlayer
     }
 }
 
-// Converts standard or extensible IEEE-float WAV audio to temporary PCM16 WAV.
-// Returns false for non-float WAV files or unsupported/invalid float layouts.
+
+
 public static class WavFloatConverter {
     private static readonly byte[] IeeeFloatSubFormat = new byte[] {
         0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10, 0x00,
@@ -948,7 +960,7 @@ public static class WavFloatConverter {
     public static bool TryPrepare(string inputPath, string outputPath, bool isWav) {
         try {
             if (isWav) {
-                if (TryConvertFile(inputPath, outputPath)) return true;
+                //if (TryConvertFile(inputPath, outputPath)) return true;
                 long start = FindWavStart(inputPath);
                 if (start > 0) return CopyFrom(inputPath, start, outputPath);
                 return false;
@@ -964,59 +976,14 @@ public static class WavFloatConverter {
     // Entry point: converts when the file (or a RIFF/WAVE container hidden behind
     // leading junk bytes) is IEEE-float. Ordinary PCM files return false quickly,
     // because a valid RIFF/WAVE header at offset 0 is never scanned past.
-    public static bool TryConvertFile(string inputPath, string outputPath) {
+    
+
+    // Decodes IEEE-float WAV data directly to signed 16-bit PCM in memory.
+    // Returns false for non-float WAVs or layouts not handled by waveOut.
+    public static bool TryDecodeToPcm(string inputPath, out byte[] pcm, out int channels, out int sampleRate) {
+        pcm = null; channels = 0; sampleRate = 0;
         try {
-            long length = new FileInfo(inputPath).Length;
-            if (length < 12) return false;
-
-            using (FileStream fs = new FileStream(inputPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite)) {
-                byte[] head = new byte[12];
-                int got = 0;
-                while (got < 12) {
-                    int c = fs.Read(head, got, 12 - got);
-                    if (c <= 0) break;
-                    got += c;
-                }
-                if (got == 12 &&
-                    head[0] == 0x52 && head[1] == 0x49 && head[2] == 0x46 && head[3] == 0x46 &&
-                    head[8] == 0x57 && head[9] == 0x41 && head[10] == 0x56 && head[11] == 0x45) {
-                    return TryConvert(inputPath, 0, outputPath);
-                }
-
-                // Leading non-audio bytes: search for an embedded RIFF/WAVE header.
-                const int ChunkSize = 65536;
-                byte[] buf = new byte[ChunkSize];
-                long pos = 0;
-                while (pos < length) {
-                    fs.Position = pos;
-                    int read = 0;
-                    while (read < ChunkSize) {
-                        int c = fs.Read(buf, read, ChunkSize - read);
-                        if (c <= 0) break;
-                        read += c;
-                    }
-                    if (read < 12) break;
-
-                    for (int i = 0; i + 12 <= read; i++) {
-                        if (buf[i] == 0x52 && buf[i + 1] == 0x49 && buf[i + 2] == 0x46 && buf[i + 3] == 0x46 &&
-                            buf[i + 8] == 0x57 && buf[i + 9] == 0x41 && buf[i + 10] == 0x56 && buf[i + 11] == 0x45) {
-                            if (TryConvert(inputPath, pos + i, outputPath)) return true;
-                        }
-                    }
-
-                    if (pos + read >= length) break;
-                    pos += read - 11;   // overlap so a header on a chunk boundary is not missed
-                }
-            }
-            return false;
-        } catch {
-            return false;
-        }
-    }
-
-    public static bool TryConvert(string inputPath, long startOffset, string outputPath) {
-        bool outputCreated = false;
-        try {
+            long startOffset = FindWavStart(inputPath);
             using (FileStream input = new FileStream(inputPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
             using (BinaryReader reader = new BinaryReader(input)) {
                 if (startOffset < 0 || startOffset + 12 > input.Length) return false;
@@ -1029,8 +996,7 @@ public static class WavFloatConverter {
                 if (containerEnd > input.Length || containerEnd < startOffset + 12) return false;
 
                 byte[] format = null;
-                long dataOffset = -1;
-                long dataSize = -1;
+                long dataOffset = -1, dataSize = -1;
                 long position = startOffset + 12;
                 while (position + 8 <= containerEnd) {
                     input.Position = position;
@@ -1058,87 +1024,1111 @@ public static class WavFloatConverter {
                 if (position != containerEnd || format == null || dataOffset < 0 || dataSize <= 0) return false;
 
                 ushort formatTag = BitConverter.ToUInt16(format, 0);
-                int channels = BitConverter.ToUInt16(format, 2);
-                uint sampleRate = BitConverter.ToUInt32(format, 4);
+                int ch = BitConverter.ToUInt16(format, 2);
+                uint hz = BitConverter.ToUInt32(format, 4);
                 uint byteRate = BitConverter.ToUInt32(format, 8);
                 ushort blockAlign = BitConverter.ToUInt16(format, 12);
-                ushort bitsPerSample = BitConverter.ToUInt16(format, 14);
+                ushort bits = BitConverter.ToUInt16(format, 14);
                 bool isFloat = formatTag == 3;
 
                 if (formatTag == 0xFFFE) {
-                    if (format.Length < 40 || BitConverter.ToUInt16(format, 16) < 22) return false;
-                    if (BitConverter.ToUInt16(format, 18) != bitsPerSample) return false;
+                    if (format.Length < 40 || BitConverter.ToUInt16(format, 16) < 22 ||
+                        BitConverter.ToUInt16(format, 18) != bits) return false;
                     isFloat = true;
                     for (int i = 0; i < 16; i++) {
                         if (format[24 + i] != IeeeFloatSubFormat[i]) { isFloat = false; break; }
                     }
                 }
-                if (!isFloat) return false;
-                if (channels < 1 || channels > 32 || sampleRate < 1 || sampleRate > 768000) return false;
-                if (bitsPerSample != 32 && bitsPerSample != 64) return false;
+                if (!isFloat || ch < 1 || ch > 2 || hz < 1 || hz > 768000 ||
+                    (bits != 32 && bits != 64)) return false;
 
-                int bytesPerSample = bitsPerSample / 8;
-                int expectedBlockAlign = channels * bytesPerSample;
+                int bytesPerSample = bits / 8;
+                int expectedBlockAlign = ch * bytesPerSample;
                 if (blockAlign != expectedBlockAlign || dataSize % blockAlign != 0 ||
-                    byteRate != (long)sampleRate * blockAlign) return false;
-                long outputDataSize = (dataSize / bytesPerSample) * 2L;
-                long outputByteRate = (long)sampleRate * channels * 2L;
-                int outputBlockAlign = channels * 2;
-                if (outputDataSize > UInt32.MaxValue - 36L || outputByteRate > UInt32.MaxValue || outputBlockAlign > UInt16.MaxValue) return false;
+                    byteRate != (long)hz * blockAlign) return false;
 
-                using (FileStream output = new FileStream(outputPath, FileMode.CreateNew, FileAccess.Write, FileShare.None))
-                using (BinaryWriter writer = new BinaryWriter(output)) {
-                    outputCreated = true;
-                    writer.Write(Encoding.ASCII.GetBytes("RIFF"));
-                    writer.Write((uint)(36L + outputDataSize));
-                    writer.Write(Encoding.ASCII.GetBytes("WAVE"));
-                    writer.Write(Encoding.ASCII.GetBytes("fmt "));
-                    writer.Write((uint)16);
-                    writer.Write((ushort)1); // WAVE_FORMAT_PCM
-                    writer.Write((ushort)channels);
-                    writer.Write(sampleRate);
-                    writer.Write((uint)outputByteRate);
-                    writer.Write((ushort)outputBlockAlign);
-                    writer.Write((ushort)16);
-                    writer.Write(Encoding.ASCII.GetBytes("data"));
-                    writer.Write((uint)outputDataSize);
+                long outputLength = (dataSize / bytesPerSample) * 2L;
+                if (outputLength <= 0 || outputLength > Int32.MaxValue) return false;
+                byte[] converted = new byte[(int)outputLength];
+                byte[] buffer = new byte[65536 - (65536 % bytesPerSample)];
+                input.Position = dataOffset;
+                long remaining = dataSize;
+                int outputOffset = 0;
 
-                    input.Position = dataOffset;
-                    byte[] buffer = new byte[65536 - (65536 % bytesPerSample)];
-                    long remaining = dataSize;
-                    while (remaining > 0) {
-                        int wanted = (int)Math.Min(buffer.Length, remaining);
-                        wanted -= wanted % bytesPerSample;
-                        if (wanted <= 0) throw new IOException("Invalid IEEE-float WAV data length.");
-                        int read = 0;
-                        while (read < wanted) {
-                            int count = input.Read(buffer, read, wanted - read);
-                            if (count <= 0) throw new IOException("Unexpected end of IEEE-float WAV data.");
-                            read += count;
-                        }
-                        for (int i = 0; i < read; i += bytesPerSample) {
-                            double sample = bitsPerSample == 32
-                                ? (double)BitConverter.ToSingle(buffer, i)
-                                : BitConverter.ToDouble(buffer, i);
-                            short pcmSample;
-                            if (Double.IsNaN(sample) || Double.IsInfinity(sample)) pcmSample = 0;
-                            else if (sample >= 1.0) pcmSample = Int16.MaxValue;
-                            else if (sample <= -1.0) pcmSample = Int16.MinValue;
-                            else pcmSample = (short)Math.Round(sample < 0 ? sample * 32768.0 : sample * 32767.0);
-                            writer.Write(pcmSample);
-                        }
-                        remaining -= read;
+                while (remaining > 0) {
+                    int wanted = (int)Math.Min(buffer.Length, remaining);
+                    wanted -= wanted % bytesPerSample;
+                    if (wanted <= 0) return false;
+                    int read = 0;
+                    while (read < wanted) {
+                        int count = input.Read(buffer, read, wanted - read);
+                        if (count <= 0) return false;
+                        read += count;
                     }
-                    writer.Flush();
+
+                    for (int i = 0; i < read; i += bytesPerSample) {
+                        double sample = bits == 32
+                            ? (double)BitConverter.ToSingle(buffer, i)
+                            : BitConverter.ToDouble(buffer, i);
+                        short pcmSample;
+                        if (Double.IsNaN(sample) || Double.IsInfinity(sample)) pcmSample = 0;
+                        else if (sample >= 1.0) pcmSample = Int16.MaxValue;
+                        else if (sample <= -1.0) pcmSample = Int16.MinValue;
+                        else pcmSample = (short)Math.Round(sample < 0 ? sample * 32768.0 : sample * 32767.0);
+                        ushort sampleBits = unchecked((ushort)pcmSample);
+                        converted[outputOffset++] = (byte)(sampleBits & 0xFF);
+                        converted[outputOffset++] = (byte)(sampleBits >> 8);
+                    }
+                    remaining -= read;
                 }
+
+                pcm = converted;
+                channels = ch;
+                sampleRate = (int)hz;
+                return true;
             }
-            return true;
         } catch {
-            if (outputCreated) {
-                try { if (File.Exists(outputPath)) File.Delete(outputPath); } catch { }
-            }
+            pcm = null; channels = 0; sampleRate = 0;
             return false;
         }
+    }
+	
+}
+// ---- Managed audio decoders --------------------------
+public static class AudioDecoders
+{
+    // AIFF decoding returns 16-bit PCM in memory.
+    public static string DecodeAiff(string inPath, out byte[] pcm, out int channels, out int sampleRate)
+    {
+        try { return AiffDecoder.Decode(inPath, out pcm, out channels, out sampleRate); }
+        catch (Exception ex) { pcm = null; channels = 0; sampleRate = 0; return ex.Message; }
+    }
+
+}
+
+// Direct PCM playback for OGG Vorbis, supported AIFF files, and IEEE-float WAVs.
+// Audio is decoded or converted in memory and submitted to Windows waveOut.
+public static class DirectPcmAudioEngine
+{
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Ansi)]
+    private struct WaveFormat { public ushort wFormatTag, nChannels; public uint nSamplesPerSec, nAvgBytesPerSec; public ushort nBlockAlign, wBitsPerSample, cbSize; }
+    [StructLayout(LayoutKind.Sequential)]
+    private struct WaveHeader { public IntPtr lpData; public uint dwBufferLength, dwBytesRecorded; public UIntPtr dwUser; public uint dwFlags, dwLoops; public IntPtr lpNext; public UIntPtr reserved; }
+    [StructLayout(LayoutKind.Sequential)]
+    private struct MmTime { public uint wType; public uint u; public uint u2; }
+    [DllImport("winmm.dll")] private static extern uint waveOutOpen(out IntPtr h, uint device, ref WaveFormat fmt, IntPtr callback, IntPtr instance, uint flags);
+    [DllImport("winmm.dll")] private static extern uint waveOutPrepareHeader(IntPtr h, IntPtr header, uint size);
+    [DllImport("winmm.dll")] private static extern uint waveOutUnprepareHeader(IntPtr h, IntPtr header, uint size);
+    [DllImport("winmm.dll")] private static extern uint waveOutWrite(IntPtr h, IntPtr header, uint size);
+    [DllImport("winmm.dll")] private static extern uint waveOutPause(IntPtr h);
+    [DllImport("winmm.dll")] private static extern uint waveOutRestart(IntPtr h);
+    [DllImport("winmm.dll")] private static extern uint waveOutReset(IntPtr h);
+    [DllImport("winmm.dll")] private static extern uint waveOutClose(IntPtr h);
+    [DllImport("winmm.dll")] private static extern uint waveOutGetPosition(IntPtr h, ref MmTime time, uint size);
+    [DllImport("winmm.dll")] private static extern uint waveOutSetVolume(IntPtr h, uint volume);
+    private static IntPtr device = IntPtr.Zero, headerPtr = IntPtr.Zero;
+    private static GCHandle pcmPin;
+    private static byte[] pcm;
+    private static int channels, rate, blockAlign, startByte;
+    private static bool opened, paused;
+    private static readonly int HeaderSize = Marshal.SizeOf(typeof(WaveHeader));
+    private static void Check(uint result, string operation) { if (result != 0) throw new InvalidOperationException(operation + " failed (MMRESULT " + result + ")"); }
+    private static void Submit(int byteOffset)
+    {
+        startByte = Math.Max(0, Math.Min(byteOffset, pcm.Length)); startByte -= startByte % blockAlign;
+        WaveHeader wh = new WaveHeader(); wh.lpData = IntPtr.Add(pcmPin.AddrOfPinnedObject(), startByte); wh.dwBufferLength = (uint)(pcm.Length - startByte);
+        Marshal.StructureToPtr(wh, headerPtr, false);
+        Check(waveOutPrepareHeader(device, headerPtr, (uint)HeaderSize), "waveOutPrepareHeader");
+        Check(waveOutWrite(device, headerPtr, (uint)HeaderSize), "waveOutWrite"); paused = false;
+    }
+    private static void OpenPcm(byte[] data, int ch, int hz)
+    {
+        Close();
+        if (data == null || data.Length == 0) throw new InvalidOperationException("Decoder returned no PCM samples");
+        if (ch < 1 || ch > 2 || hz < 1) throw new InvalidOperationException("Unsupported PCM channel count or sample rate");
+        pcm = data; channels = ch; rate = hz; blockAlign = channels * 2; startByte = 0;
+        pcmPin = GCHandle.Alloc(pcm, GCHandleType.Pinned);
+        WaveFormat fmt = new WaveFormat(); fmt.wFormatTag = 1; fmt.nChannels = (ushort)channels; fmt.nSamplesPerSec = (uint)rate; fmt.wBitsPerSample = 16; fmt.nBlockAlign = (ushort)blockAlign; fmt.nAvgBytesPerSec = (uint)(rate * blockAlign); fmt.cbSize = 0;
+        try { Check(waveOutOpen(out device, 0xFFFFFFFF, ref fmt, IntPtr.Zero, IntPtr.Zero, 0), "waveOutOpen"); opened = true; headerPtr = Marshal.AllocHGlobal(HeaderSize); Submit(0); }
+        catch { Close(); throw; }
+    }
+    public static void Open(string path)
+    {
+        byte[] data; int ch, hz;
+        string error = VorbisDecoder.Decode(path, out data, out ch, out hz);
+        if (error != null) throw new InvalidOperationException("Vorbis decoder: " + error);
+        OpenPcm(data, ch, hz);
+    }
+    public static void OpenAiff(string path)
+    {
+        byte[] data; int ch, hz;
+        string error = AudioDecoders.DecodeAiff(path, out data, out ch, out hz);
+        if (error != null) throw new InvalidOperationException("AIFF decoder: " + error);
+        OpenPcm(data, ch, hz);
+    }
+    public static bool OpenWavFloat(string path)
+    {
+        byte[] data; int ch, hz;
+        if (!WavFloatConverter.TryDecodeToPcm(path, out data, out ch, out hz)) return false;
+        OpenPcm(data, ch, hz);
+        return true;
+    }
+    public static void Play() { if (opened && paused) { Check(waveOutRestart(device), "waveOutRestart"); paused = false; } }
+    public static void Pause() { if (opened && !paused) { Check(waveOutPause(device), "waveOutPause"); paused = true; } }
+    public static void Stop() { if (opened) { waveOutReset(device); paused = true; } }
+    public static void Close()
+    {
+        if (opened) { try { waveOutReset(device); } catch { } try { waveOutUnprepareHeader(device, headerPtr, (uint)HeaderSize); } catch { } try { waveOutClose(device); } catch { } }
+        opened = false; paused = false; device = IntPtr.Zero;
+        if (headerPtr != IntPtr.Zero) { Marshal.FreeHGlobal(headerPtr); headerPtr = IntPtr.Zero; }
+        if (pcmPin.IsAllocated) pcmPin.Free(); pcm = null;
+    }
+    public static long GetDurationMilliseconds() { return pcm == null || rate == 0 ? 0 : (long)pcm.Length * 1000L / (rate * blockAlign); }
+    public static long GetPositionMilliseconds()
+    {
+        if (!opened) return 0; MmTime t = new MmTime(); t.wType = 4; Check(waveOutGetPosition(device, ref t, (uint)Marshal.SizeOf(typeof(MmTime))), "waveOutGetPosition");
+        long bytes = Math.Min((long)pcm.Length, (long)startByte + t.u); return bytes * 1000L / (rate * blockAlign);
+    }
+    public static void SetPositionMilliseconds(long ms)
+    {
+        if (!opened) return; bool wasPaused = paused; long frame = Math.Max(0, Math.Min((long)pcm.Length / blockAlign, ms * rate / 1000L));
+        Check(waveOutReset(device), "waveOutReset"); try { waveOutUnprepareHeader(device, headerPtr, (uint)HeaderSize); } catch { }
+        if (frame >= (long)pcm.Length / blockAlign) { startByte = pcm.Length; paused = false; return; }
+        Submit((int)(frame * blockAlign)); if (wasPaused) Pause();
+    }
+    public static bool SetVolume(int percent)
+    {
+        if (!opened) return true; uint v = (uint)(Math.Max(0, Math.Min(100, percent)) * 0xFFFF / 100); uint packed = v | (v << 16); return waveOutSetVolume(device, packed) == 0;
+    }
+    // Match the MFPlay state values consumed by the existing queue controller.
+    public static int GetState() { if (!opened) return 0; if (GetPositionMilliseconds() >= GetDurationMilliseconds()) return 1; if (paused) return 3; return 2; }
+}
+
+internal static class AiffDecoder
+{
+    private static uint BE32(byte[] b, int o) { return (uint)(b[o] << 24 | b[o + 1] << 16 | b[o + 2] << 8 | b[o + 3]); }
+    private static int BE16(byte[] b, int o) { return b[o] << 8 | b[o + 1]; }
+
+    public static string Decode(string inPath, out byte[] pcm, out int channels, out int sampleRate)
+    {
+        pcm = null; channels = 0; sampleRate = 0;
+        byte[] f = File.ReadAllBytes(inPath);
+        if (f.Length < 12 || Encoding.ASCII.GetString(f, 0, 4) != "FORM") return "not an AIFF file";
+        string form = Encoding.ASCII.GetString(f, 8, 4);
+        bool aifc = form == "AIFC";
+        if (!aifc && form != "AIFF") return "not an AIFF file";
+
+        int bits = 0, dataOff = -1, dataLen = 0;
+        long frames = 0; double rate = 0; bool littleEndian = false;
+        int pos = 12;
+        while (pos + 8 <= f.Length)
+        {
+            string id = Encoding.ASCII.GetString(f, pos, 4);
+            uint chunkLength = BE32(f, pos + 4);
+            if (chunkLength > Int32.MaxValue) return "AIFF chunk is too large";
+            int len = (int)chunkLength;
+            int body = pos + 8;
+            if (body > f.Length || len > f.Length - body) return "truncated AIFF chunk";
+            if (id == "COMM" && len >= 18)
+            {
+                channels = BE16(f, body);
+                frames = BE32(f, body + 2);
+                bits = BE16(f, body + 6);
+                int exp = BE16(f, body + 8) & 0x7FFF;
+                ulong mant = ((ulong)BE32(f, body + 10) << 32) | BE32(f, body + 14);
+                rate = mant * Math.Pow(2, exp - 16383 - 63);
+                if (aifc)
+                {
+                    if (len < 22) return "AIFF-C compression type is missing";
+                    string comp = Encoding.ASCII.GetString(f, body + 18, 4);
+                    if (comp == "sowt") littleEndian = true;
+                    else if (comp != "NONE" && comp != "twos") return "compressed AIFF-C (" + comp + ") is not supported";
+                }
+            }
+            else if (id == "SSND" && len >= 8)
+            {
+                uint offset = BE32(f, body);
+                if (offset > (uint)(len - 8)) return "invalid AIFF sound-data offset";
+                dataOff = body + 8 + (int)offset;
+                dataLen = len - 8 - (int)offset;
+            }
+            long next = (long)body + len + (len & 1);
+            if (next > f.Length) return "truncated AIFF chunk padding";
+            pos = (int)next;
+        }
+        if (channels < 1 || channels > 2 || dataOff < 0 || bits < 8 || bits > 32 || rate < 1 || rate > 384000)
+            return "unsupported AIFF layout (requires mono/stereo integer PCM, 8-32 bits)";
+        int bytesPerSample = (bits + 7) / 8;
+        long sampleCount = (long)dataLen / bytesPerSample;
+        long frameCount = sampleCount / channels;
+        if (frames > 0) frameCount = Math.Min(frameCount, frames);
+        long outputBytes = frameCount * channels * 2;
+        if (outputBytes <= 0 || outputBytes > Int32.MaxValue) return "AIFF PCM data is empty or too large for in-memory playback";
+        pcm = new byte[(int)outputBytes];
+        int count = (int)(frameCount * channels);
+        for (int i = 0; i < count; i++)
+        {
+            int o = dataOff + i * bytesPerSample;
+            short sample;
+            if (littleEndian)
+            {
+                int hi = f[o + bytesPerSample - 1];
+                int lo = bytesPerSample > 1 ? f[o + bytesPerSample - 2] : 0;
+                sample = unchecked((short)((hi << 8) | lo));
+            }
+            else if (bytesPerSample == 1) sample = unchecked((short)((sbyte)f[o] << 8));
+            else sample = unchecked((short)((f[o] << 8) | f[o + 1]));
+            pcm[i * 2] = (byte)(sample & 0xFF);
+            pcm[i * 2 + 1] = (byte)((sample >> 8) & 0xFF);
+        }
+        sampleRate = (int)Math.Round(rate);
+        return null;
+    }
+}
+
+internal class VorbisException : Exception
+{
+    public VorbisException(string m) : base(m) { }
+}
+
+internal class VBitReader
+{
+    private byte[] data; private int pos; private int bit;
+    public bool Eop;
+    public VBitReader(byte[] d) { data = d; }
+    public uint Read(int n)
+    {
+        uint r = 0; int got = 0;
+        while (got < n)
+        {
+            if (pos >= data.Length) { Eop = true; return r; }
+            int take = Math.Min(8 - bit, n - got);
+            uint v = ((uint)data[pos] >> bit) & ((1u << take) - 1);
+            r |= v << got;
+            got += take; bit += take;
+            if (bit == 8) { bit = 0; pos++; }
+        }
+        return r;
+    }
+}
+
+internal class OggPacketReader
+{
+    private Stream s; private bool serialSet; private uint serial; private bool finished;
+    public long EosGranule = -1;
+    private Queue<byte[]> queue = new Queue<byte[]>();
+    private MemoryStream partial = new MemoryStream();
+    public OggPacketReader(Stream st) { s = st; }
+
+    public byte[] NextPacket()
+    {
+        while (queue.Count == 0) { if (!ReadPage()) return null; }
+        return queue.Dequeue();
+    }
+
+    private bool ReadExact(byte[] b, int n)
+    {
+        int got = 0;
+        while (got < n) { int r = s.Read(b, got, n - got); if (r <= 0) return false; got += r; }
+        return true;
+    }
+
+    private bool ReadPage()
+    {
+        if (finished) return false;
+        // find capture pattern "OggS"
+        int state = 0;
+        while (state < 4)
+        {
+            int c = s.ReadByte();
+            if (c < 0) return false;
+            if (c == "OggS"[state]) state++;
+            else state = (c == 'O') ? 1 : 0;
+        }
+        byte[] h = new byte[23];
+        if (!ReadExact(h, 23)) return false;
+        int type = h[1];
+        uint ser = (uint)(h[10] | h[11] << 8 | h[12] << 16 | h[13] << 24);
+        int nseg = h[22];
+        byte[] lace = new byte[nseg];
+        if (!ReadExact(lace, nseg)) return false;
+        int total = 0;
+        for (int i = 0; i < nseg; i++) total += lace[i];
+        byte[] body = new byte[total];
+        if (!ReadExact(body, total)) return false;
+
+        if (!serialSet) { serial = ser; serialSet = true; }
+        else if (ser != serial) return true;   // ignore other logical streams
+
+        if ((type & 1) == 0 && partial.Length > 0) partial.SetLength(0);
+        int off = 0;
+        for (int i = 0; i < nseg; i++)
+        {
+            partial.Write(body, off, lace[i]);
+            off += lace[i];
+            if (lace[i] < 255) { queue.Enqueue(partial.ToArray()); partial.SetLength(0); }
+        }
+        if ((type & 4) != 0)
+        {
+            finished = true;
+            long g = BitConverter.ToInt64(h, 2);
+            if (g >= 0) EosGranule = g;
+        }
+        return true;
+    }
+}
+
+internal class VCodebook
+{
+    public int Dim, Entries;
+    public float[] Vectors;            // Entries * Dim, null when no lookup table
+    private List<int> left = new List<int>(), right = new List<int>();
+
+    private static int Ilog(int x) { int r = 0; while (x > 0) { r++; x >>= 1; } return r; }
+
+    private static float Unpack(uint v)
+    {
+        double mant = v & 0x1FFFFF;
+        int exp = (int)((v & 0x7FE00000) >> 21);
+        if ((v & 0x80000000) != 0) mant = -mant;
+        return (float)(mant * Math.Pow(2.0, exp - 788));
+    }
+
+    public static VCodebook Read(VBitReader br)
+    {
+        if (br.Read(24) != 0x564342) throw new VorbisException("bad codebook sync");
+        VCodebook cb = new VCodebook();
+        cb.Dim = (int)br.Read(16);
+        cb.Entries = (int)br.Read(24);
+        int n = cb.Entries;
+        int[] len = new int[n];
+        bool ordered = br.Read(1) != 0;
+        if (!ordered)
+        {
+            bool sparse = br.Read(1) != 0;
+            for (int i = 0; i < n; i++)
+            {
+                if (sparse) len[i] = br.Read(1) != 0 ? (int)br.Read(5) + 1 : 0;
+                else len[i] = (int)br.Read(5) + 1;
+            }
+        }
+        else
+        {
+            int cur = 0, curLen = (int)br.Read(5) + 1;
+            while (cur < n)
+            {
+                int num = (int)br.Read(Ilog(n - cur));
+                if (cur + num > n) throw new VorbisException("bad codebook lengths");
+                for (int i = 0; i < num; i++) len[cur + i] = curLen;
+                cur += num; curLen++;
+                if (num == 0 && curLen > 33) throw new VorbisException("bad codebook lengths");
+            }
+        }
+        cb.BuildTree(len);
+
+        int lookup = (int)br.Read(4);
+        if (lookup == 1 || lookup == 2)
+        {
+            float minv = Unpack(br.Read(32)), delta = Unpack(br.Read(32));
+            int valueBits = (int)br.Read(4) + 1;
+            bool seq = br.Read(1) != 0;
+            int lookupValues;
+            if (lookup == 1)
+            {
+                lookupValues = (int)Math.Floor(Math.Pow(n, 1.0 / cb.Dim));
+                while (Pow(lookupValues + 1, cb.Dim) <= n) lookupValues++;
+                while (lookupValues > 0 && Pow(lookupValues, cb.Dim) > n) lookupValues--;
+            }
+            else lookupValues = n * cb.Dim;
+            float[] mult = new float[lookupValues];
+            for (int i = 0; i < lookupValues; i++) mult[i] = br.Read(valueBits);
+            cb.Vectors = new float[n * cb.Dim];
+            for (int e = 0; e < n; e++)
+            {
+                float last = 0; int idiv = 1;
+                for (int j = 0; j < cb.Dim; j++)
+                {
+                    int moff = lookup == 1 ? (e / idiv) % lookupValues : e * cb.Dim + j;
+                    float v = mult[moff] * delta + minv + last;
+                    if (seq) last = v;
+                    cb.Vectors[e * cb.Dim + j] = v;
+                    if (lookup == 1) idiv *= lookupValues;
+                }
+            }
+        }
+        else if (lookup != 0) throw new VorbisException("bad codebook lookup type");
+        if (br.Eop) throw new VorbisException("truncated setup header");
+        return cb;
+    }
+
+    private static long Pow(int b, int e)
+    {
+        long r = 1;
+        for (int i = 0; i < e; i++) { r *= b; if (r > 100000000L) return r; }
+        return r;
+    }
+
+    private void BuildTree(int[] len)
+    {
+        left.Add(0); right.Add(0);
+        uint[] avail = new uint[33];
+        int k = 0;
+        while (k < len.Length && len[k] == 0) k++;
+        if (k == len.Length) return;
+        Insert(0, len[k], k);
+        for (int i = 1; i <= len[k]; i++) avail[i] = 1u << (32 - i);
+        for (int i = k + 1; i < len.Length; i++)
+        {
+            int z = len[i];
+            if (z == 0) continue;
+            while (z > 0 && avail[z] == 0) z--;
+            if (z == 0) throw new VorbisException("over-specified codebook");
+            uint res = avail[z]; avail[z] = 0;
+            Insert(res, len[i], i);
+            if (z != len[i]) for (int y = len[i]; y > z; y--) avail[y] = res + (1u << (32 - y));
+        }
+    }
+
+    private void Insert(uint code, int length, int entry)
+    {
+        int node = 0;
+        for (int j = 0; j < length; j++)
+        {
+            int bit = (int)((code >> (31 - j)) & 1);
+            List<int> arr = bit == 0 ? left : right;
+            if (j == length - 1) { arr[node] = ~entry; return; }
+            int next = arr[node];
+            if (next == 0) { next = left.Count; left.Add(0); right.Add(0); arr[node] = next; }
+            else if (next < 0) throw new VorbisException("bad huffman tree");
+            node = next;
+        }
+    }
+
+    private int[] leftA, rightA;
+    public int DecodeScalar(VBitReader br)
+    {
+        if (leftA == null) { leftA = left.ToArray(); rightA = right.ToArray(); }
+        int node = 0;
+        while (true)
+        {
+            int b = (int)br.Read(1);
+            if (br.Eop) return -1;
+            int next = b == 0 ? leftA[node] : rightA[node];
+            if (next == 0) return -1;
+            if (next < 0) return ~next;
+            node = next;
+        }
+    }
+}
+
+internal class VFloor1
+{
+    public int[] PartitionClass; public int[] ClassDim, ClassSub, MasterBook;
+    public int[][] SubBooks;
+    public int Multiplier, RangeBits;
+    public int[] X; public int[] Order; public int[] LowN, HighN;
+    public int Count;
+
+    private static int Ilog(int x) { int r = 0; while (x > 0) { r++; x >>= 1; } return r; }
+
+    public static VFloor1 Read(VBitReader br)
+    {
+        VFloor1 f = new VFloor1();
+        int parts = (int)br.Read(5);
+        f.PartitionClass = new int[parts];
+        int maxClass = -1;
+        for (int i = 0; i < parts; i++) { f.PartitionClass[i] = (int)br.Read(4); if (f.PartitionClass[i] > maxClass) maxClass = f.PartitionClass[i]; }
+        f.ClassDim = new int[maxClass + 1]; f.ClassSub = new int[maxClass + 1]; f.MasterBook = new int[maxClass + 1];
+        f.SubBooks = new int[maxClass + 1][];
+        for (int i = 0; i <= maxClass; i++)
+        {
+            f.ClassDim[i] = (int)br.Read(3) + 1;
+            f.ClassSub[i] = (int)br.Read(2);
+            if (f.ClassSub[i] != 0) f.MasterBook[i] = (int)br.Read(8);
+            f.SubBooks[i] = new int[1 << f.ClassSub[i]];
+            for (int j = 0; j < f.SubBooks[i].Length; j++) f.SubBooks[i][j] = (int)br.Read(8) - 1;
+        }
+        f.Multiplier = (int)br.Read(2) + 1;
+        f.RangeBits = (int)br.Read(4);
+        List<int> xs = new List<int>(); xs.Add(0); xs.Add(1 << f.RangeBits);
+        for (int i = 0; i < parts; i++)
+            for (int j = 0; j < f.ClassDim[f.PartitionClass[i]]; j++) xs.Add((int)br.Read(f.RangeBits));
+        f.X = xs.ToArray(); f.Count = f.X.Length;
+        if (f.Count > 65) throw new VorbisException("bad floor");
+        // sort order
+        f.Order = new int[f.Count];
+        for (int i = 0; i < f.Count; i++) f.Order[i] = i;
+        int[] xx = f.X;
+        Array.Sort(f.Order, delegate(int a, int b) { int c = xx[a].CompareTo(xx[b]); return c != 0 ? c : a.CompareTo(b); });
+        // neighbours
+        f.LowN = new int[f.Count]; f.HighN = new int[f.Count];
+        for (int i = 2; i < f.Count; i++)
+        {
+            int lo = 0, hi = 1; int loV = -1, hiV = int.MaxValue;
+            for (int j = 0; j < i; j++)
+            {
+                if (f.X[j] < f.X[i] && f.X[j] > loV) { loV = f.X[j]; lo = j; }
+                if (f.X[j] > f.X[i] && f.X[j] < hiV) { hiV = f.X[j]; hi = j; }
+            }
+            f.LowN[i] = lo; f.HighN[i] = hi;
+        }
+        if (br.Eop) throw new VorbisException("truncated setup header");
+        return f;
+    }
+
+    private static float[] invDb;
+    private static float InvDb(int i)
+    {
+        if (invDb == null)
+        {
+            float[] t = new float[256];
+            for (int k = 0; k < 256; k++) t[k] = (float)Math.Pow(10.0, (k - 255) * 7.0 / 256.0);
+            invDb = t;
+        }
+        if (i < 0) i = 0; if (i > 255) i = 255;
+        return invDb[i];
+    }
+
+    private static int RenderPoint(int x0, int y0, int x1, int y1, int x)
+    {
+        int dy = y1 - y0, adx = x1 - x0, ady = Math.Abs(dy);
+        int err = ady * (x - x0);
+        int off = err / adx;
+        return dy < 0 ? y0 - off : y0 + off;
+    }
+
+    private static void RenderLine(int x0, int y0, int x1, int y1, float[] outp, int n)
+    {
+        int dy = y1 - y0, adx = x1 - x0, ady = Math.Abs(dy);
+        int bas = dy / adx;
+        int sy = dy < 0 ? bas - 1 : bas + 1;
+        ady = ady - Math.Abs(bas) * adx;
+        int x = x0, y = y0, err = 0;
+        if (x < n) outp[x] = InvDb(y);
+        for (x = x0 + 1; x < x1 && x < n; x++)
+        {
+            err += ady;
+            if (err >= adx) { err -= adx; y += sy; } else y += bas;
+            outp[x] = InvDb(y);
+        }
+    }
+
+    // Returns false if the channel carries no floor ("unused"), otherwise fills curve[0..n)
+    public bool Decode(VBitReader br, VCodebook[] books, float[] curve, int n)
+    {
+        if (br.Read(1) == 0) return false;
+        int[] range = { 256, 128, 86, 64 };
+        int rng = range[Multiplier - 1];
+        int rb = Ilog(rng - 1);
+        int[] y = new int[Count];
+        y[0] = (int)br.Read(rb); y[1] = (int)br.Read(rb);
+        int offset = 2;
+        for (int i = 0; i < PartitionClass.Length; i++)
+        {
+            int cls = PartitionClass[i], cdim = ClassDim[cls], cbits = ClassSub[cls];
+            int csub = (1 << cbits) - 1, cval = 0;
+            if (cbits > 0)
+            {
+                cval = books[MasterBook[cls]].DecodeScalar(br);
+                if (cval < 0) return false;
+            }
+            for (int j = 0; j < cdim; j++)
+            {
+                int book = SubBooks[cls][cval & csub];
+                cval >>= cbits;
+                if (book >= 0)
+                {
+                    int v = books[book].DecodeScalar(br);
+                    if (v < 0) return false;
+                    y[offset + j] = v;
+                }
+                else y[offset + j] = 0;
+            }
+            offset += cdim;
+        }
+        if (br.Eop) return false;
+
+        int[] fy = new int[Count]; bool[] flag = new bool[Count];
+        fy[0] = y[0]; fy[1] = y[1]; flag[0] = flag[1] = true;
+        for (int i = 2; i < Count; i++)
+        {
+            int lo = LowN[i], hi = HighN[i];
+            int pred = RenderPoint(X[lo], fy[lo], X[hi], fy[hi], X[i]);
+            int val = y[i];
+            int highroom = rng - pred, lowroom = pred;
+            int room = (highroom < lowroom ? highroom : lowroom) * 2;
+            if (val != 0)
+            {
+                flag[lo] = flag[hi] = flag[i] = true;
+                if (val >= room)
+                    fy[i] = highroom > lowroom ? val - lowroom + pred : pred - val + highroom - 1;
+                else
+                    fy[i] = (val & 1) != 0 ? pred - ((val + 1) >> 1) : pred + (val >> 1);
+            }
+            else { flag[i] = false; fy[i] = pred; }
+        }
+
+        int hx = 0, lx = 0, hy = 0;
+        int ly = fy[Order[0]] * Multiplier;
+        for (int i = 1; i < Count; i++)
+        {
+            int idx = Order[i];
+            if (flag[idx])
+            {
+                hy = fy[idx] * Multiplier; hx = X[idx];
+                if (hx > lx) RenderLine(lx, ly, hx, hy, curve, n);
+                lx = hx; ly = hy;
+            }
+        }
+        if (hx < n)
+        {
+            float v = InvDb(hy);
+            for (int i = hx; i < n; i++) curve[i] = v;
+        }
+        return true;
+    }
+}
+
+internal class VResidue
+{
+    public int Type, Begin, End, PartSize, Classes, ClassBook;
+    public int[][] Books;
+
+    public static VResidue Read(VBitReader br, int type)
+    {
+        VResidue r = new VResidue();
+        r.Type = type;
+        r.Begin = (int)br.Read(24); r.End = (int)br.Read(24);
+        r.PartSize = (int)br.Read(24) + 1;
+        r.Classes = (int)br.Read(6) + 1;
+        r.ClassBook = (int)br.Read(8);
+        int[] cascade = new int[r.Classes];
+        for (int i = 0; i < r.Classes; i++)
+        {
+            int low = (int)br.Read(3), high = 0;
+            if (br.Read(1) != 0) high = (int)br.Read(5);
+            cascade[i] = high * 8 + low;
+        }
+        r.Books = new int[r.Classes][];
+        for (int i = 0; i < r.Classes; i++)
+        {
+            r.Books[i] = new int[8];
+            for (int j = 0; j < 8; j++)
+                r.Books[i][j] = (cascade[i] & (1 << j)) != 0 ? (int)br.Read(8) : -1;
+        }
+        if (br.Eop) throw new VorbisException("truncated setup header");
+        return r;
+    }
+
+    // vectors: one array per channel handled together (type 2 passes a single interleaved vector)
+    public void Decode(VBitReader br, VCodebook[] books, float[][] vecs, bool[] skip, int size)
+    {
+        int ch = vecs.Length;
+        int begin = Math.Min(Begin, size), end = Math.Min(End, size);
+        VCodebook cb = books[ClassBook];
+        int cw = cb.Dim;
+        int toRead = end - begin;
+        if (toRead <= 0) return;
+        int partsToRead = toRead / PartSize;
+        int[][] cls = new int[ch][];
+        for (int j = 0; j < ch; j++) cls[j] = new int[partsToRead + cw + 1];
+        bool any = false;
+        for (int j = 0; j < ch; j++) if (!skip[j]) any = true;
+        if (!any) return;
+
+        for (int pass = 0; pass < 8; pass++)
+        {
+            int pc = 0;
+            while (pc < partsToRead)
+            {
+                if (pass == 0)
+                {
+                    for (int j = 0; j < ch; j++)
+                    {
+                        if (skip[j]) continue;
+                        int temp = cb.DecodeScalar(br);
+                        if (temp < 0) return;
+                        for (int i = cw - 1; i >= 0; i--)
+                        {
+                            cls[j][i + pc] = temp % Classes;
+                            temp /= Classes;
+                        }
+                    }
+                }
+                for (int i = 0; i < cw && pc < partsToRead; i++)
+                {
+                    for (int j = 0; j < ch; j++)
+                    {
+                        if (skip[j]) continue;
+                        int book = Books[cls[j][pc]][pass];
+                        if (book < 0) continue;
+                        VCodebook vb = books[book];
+                        if (vb.Vectors == null) return;
+                        int offset = begin + pc * PartSize;
+                        float[] v = vecs[j];
+                        int dim = vb.Dim;
+                        if (Type == 0)
+                        {
+                            int step = PartSize / dim;
+                            for (int k = 0; k < step; k++)
+                            {
+                                int e = vb.DecodeScalar(br);
+                                if (e < 0) return;
+                                for (int d = 0; d < dim; d++) v[offset + k + d * step] += vb.Vectors[e * dim + d];
+                            }
+                        }
+                        else
+                        {
+                            for (int k = 0; k < PartSize; k += dim)
+                            {
+                                int e = vb.DecodeScalar(br);
+                                if (e < 0) return;
+                                for (int d = 0; d < dim; d++) v[offset + k + d] += vb.Vectors[e * dim + d];
+                            }
+                        }
+                    }
+                    pc++;
+                }
+            }
+        }
+    }
+}
+
+internal class VMapping
+{
+    public int Submaps; public int[] Mux; public int[] Mag, Ang; public int[] SubFloor, SubResidue;
+}
+
+internal class VMode { public bool Long; public int Mapping; }
+
+internal class VImdct
+{
+    private int m;          // number of coefficients (n/2)
+    private float[] preC, preS, postC, postS, twC, twS;
+    private int[] rev;
+    private float[] re, im;
+
+    public VImdct(int n)
+    {
+        m = n / 2;
+        int h = m / 2;
+        preC = new float[h]; preS = new float[h]; postC = new float[h]; postS = new float[h];
+        for (int j = 0; j < h; j++)
+        {
+            preC[j] = (float)Math.Cos(-Math.PI * j / m); preS[j] = (float)Math.Sin(-Math.PI * j / m);
+            postC[j] = (float)Math.Cos(-Math.PI * (j + 0.25) / m); postS[j] = (float)Math.Sin(-Math.PI * (j + 0.25) / m);
+        }
+        twC = new float[h / 2 + 1]; twS = new float[h / 2 + 1];
+        for (int j = 0; j < twC.Length; j++)
+        {
+            twC[j] = (float)Math.Cos(-2 * Math.PI * j / h); twS[j] = (float)Math.Sin(-2 * Math.PI * j / h);
+        }
+        rev = new int[h];
+        int bits = 0; while ((1 << bits) < h) bits++;
+        for (int i = 0; i < h; i++)
+        {
+            int r = 0; for (int b = 0; b < bits; b++) if ((i & (1 << b)) != 0) r |= 1 << (bits - 1 - b);
+            rev[i] = r;
+        }
+        re = new float[h]; im = new float[h];
+    }
+
+    private void Fft()
+    {
+        int h = re.Length;
+        for (int i = 0; i < h; i++)
+        {
+            int j = rev[i];
+            if (j > i) { float t = re[i]; re[i] = re[j]; re[j] = t; t = im[i]; im[i] = im[j]; im[j] = t; }
+        }
+        for (int size = 2; size <= h; size <<= 1)
+        {
+            int half = size >> 1, step = h / size;
+            for (int start = 0; start < h; start += size)
+            {
+                for (int k = 0; k < half; k++)
+                {
+                    float wr = twC[k * step], wi = twS[k * step];
+                    int a = start + k, b = a + half;
+                    float xr = re[b] * wr - im[b] * wi, xi = re[b] * wi + im[b] * wr;
+                    re[b] = re[a] - xr; im[b] = im[a] - xi;
+                    re[a] += xr; im[a] += xi;
+                }
+            }
+        }
+    }
+
+    // spec[0..m) -> outp[0..2m)
+    public void Inverse(float[] spec, float[] outp, float[] z)
+    {
+        int h = m / 2;
+        for (int j = 0; j < h; j++)
+        {
+            float a = spec[2 * j], b = spec[m - 1 - 2 * j];
+            re[j] = a * preC[j] - b * preS[j];
+            im[j] = a * preS[j] + b * preC[j];
+        }
+        Fft();
+        for (int p = 0; p < h; p++)
+        {
+            float ur = re[p] * postC[p] - im[p] * postS[p];
+            float ui = re[p] * postS[p] + im[p] * postC[p];
+            z[2 * p] = ur;
+            z[m - 1 - 2 * p] = -ui;
+        }
+        int n = 2 * m, half = m / 2;
+        for (int i = 0; i < n; i++)
+        {
+            int mm = i + half; float v;
+            if (mm < m) v = z[mm];
+            else if (mm < 2 * m) v = -z[2 * m - 1 - mm];
+            else v = -z[mm - 2 * m];
+            outp[i] = v;
+        }
+    }
+}
+
+internal static class VorbisDecoder
+{
+    private static int Ilog(int x) { int r = 0; while (x > 0) { r++; x >>= 1; } return r; }
+
+    public static string Decode(string inPath, out byte[] pcm, out int outputChannels, out int outputRate)
+    {
+        pcm = null; outputChannels = 0; outputRate = 0;
+        using (FileStream fin = new FileStream(inPath, FileMode.Open, FileAccess.Read, FileShare.Read, 65536))
+        using (MemoryStream fout = new MemoryStream())
+        {
+            OggPacketReader ogg = new OggPacketReader(new BufferedStream(fin, 65536));
+            byte[] p = ogg.NextPacket();
+            if (p == null) return "empty or invalid Ogg file";
+            if (p.Length >= 8 && Encoding.ASCII.GetString(p, 0, 8) == "OpusHead") return "OPUS";
+            if (p.Length < 30 || p[0] != 1 || Encoding.ASCII.GetString(p, 1, 6) != "vorbis")
+                return "Ogg file does not contain Vorbis audio";
+
+            int channels = p[11];
+            int rate = p[12] | p[13] << 8 | p[14] << 16 | p[15] << 24;
+            if (rate < 8000 || rate > 192000) return "unsupported Vorbis sample rate";
+            int bs0 = 1 << (p[28] & 15), bs1 = 1 << (p[28] >> 4);
+            if (channels < 1 || channels > 2) return "only mono/stereo Vorbis is supported (found " + channels + " channels)";
+            if (bs0 < 64 || bs1 < bs0 || bs1 > 8192) return "bad Vorbis block sizes";
+
+            p = ogg.NextPacket();                                  // comment header
+            if (p == null || p[0] != 3) return "missing Vorbis comment header";
+            p = ogg.NextPacket();                                  // setup header
+            if (p == null || p[0] != 5) return "missing Vorbis setup header";
+
+            VBitReader br = new VBitReader(p);
+            br.Read(8); for (int i = 0; i < 6; i++) br.Read(8);   // packet type + "vorbis"
+            int ncb = (int)br.Read(8) + 1;
+            VCodebook[] books = new VCodebook[ncb];
+            for (int i = 0; i < ncb; i++) books[i] = VCodebook.Read(br);
+            int nt = (int)br.Read(6) + 1;
+            for (int i = 0; i < nt; i++) br.Read(16);
+            int nf = (int)br.Read(6) + 1;
+            VFloor1[] floors = new VFloor1[nf];
+            for (int i = 0; i < nf; i++)
+            {
+                int ft = (int)br.Read(16);
+                if (ft != 1) return "this file uses Vorbis floor type " + ft + " (not supported)";
+                floors[i] = VFloor1.Read(br);
+            }
+            int nr = (int)br.Read(6) + 1;
+            VResidue[] res = new VResidue[nr];
+            for (int i = 0; i < nr; i++)
+            {
+                int rt = (int)br.Read(16);
+                if (rt > 2) return "bad residue type";
+                res[i] = VResidue.Read(br, rt);
+            }
+            int nm = (int)br.Read(6) + 1;
+            VMapping[] maps = new VMapping[nm];
+            for (int i = 0; i < nm; i++)
+            {
+                if (br.Read(16) != 0) return "bad mapping type";
+                VMapping mp = new VMapping();
+                mp.Submaps = br.Read(1) != 0 ? (int)br.Read(4) + 1 : 1;
+                int steps = br.Read(1) != 0 ? (int)br.Read(8) + 1 : 0;
+                mp.Mag = new int[steps]; mp.Ang = new int[steps];
+                for (int s = 0; s < steps; s++)
+                {
+                    mp.Mag[s] = (int)br.Read(Ilog(channels - 1));
+                    mp.Ang[s] = (int)br.Read(Ilog(channels - 1));
+                }
+                br.Read(2);
+                mp.Mux = new int[channels];
+                if (mp.Submaps > 1) for (int c = 0; c < channels; c++) mp.Mux[c] = (int)br.Read(4);
+                mp.SubFloor = new int[mp.Submaps]; mp.SubResidue = new int[mp.Submaps];
+                for (int s = 0; s < mp.Submaps; s++)
+                {
+                    br.Read(8);
+                    mp.SubFloor[s] = (int)br.Read(8); mp.SubResidue[s] = (int)br.Read(8);
+                    if (mp.SubFloor[s] >= nf || mp.SubResidue[s] >= nr) return "bad mapping";
+                }
+                maps[i] = mp;
+            }
+            int nmodes = (int)br.Read(6) + 1;
+            VMode[] modes = new VMode[nmodes];
+            for (int i = 0; i < nmodes; i++)
+            {
+                modes[i] = new VMode();
+                modes[i].Long = br.Read(1) != 0;
+                br.Read(16); br.Read(16);
+                modes[i].Mapping = (int)br.Read(8);
+                if (modes[i].Mapping >= nm) return "bad mode";
+            }
+            if (br.Eop) return "truncated Vorbis setup header";
+
+            // --- audio ---
+            VImdct imdctS = new VImdct(bs0), imdctL = new VImdct(bs1);
+            float[] winS = MakeSlope(bs0 / 2), winL = MakeSlope(bs1 / 2);
+            float[][] prev = null; int prevN = 0;
+            float[][] cur = new float[channels][];
+            for (int c = 0; c < channels; c++) cur[c] = new float[bs1];
+            float[] z = new float[bs1 / 2];
+            float[][] spec = new float[channels][];
+            float[][] floorCurve = new float[channels][];
+            for (int c = 0; c < channels; c++) { spec[c] = new float[bs1 / 2]; floorCurve[c] = new float[bs1 / 2]; }
+            bool[] hasFloor = new bool[channels], noRes = new bool[channels];
+
+            long dataBytes = 0;
+            byte[] ob = new byte[8192 * channels * 2 * 2];
+
+            while ((p = ogg.NextPacket()) != null)
+            {
+                VBitReader pr = new VBitReader(p);
+                if (pr.Read(1) != 0) continue;                    // not an audio packet
+                int mi = (int)pr.Read(Ilog(nmodes - 1));
+                if (mi >= nmodes || pr.Eop) continue;
+                VMode mode = modes[mi];
+                int n = mode.Long ? bs1 : bs0;
+                bool prevLong = true, nextLong = true;
+                if (mode.Long) { prevLong = pr.Read(1) != 0; nextLong = pr.Read(1) != 0; }
+                int half = n / 2;
+                VMapping mp = maps[mode.Mapping];
+
+                for (int c = 0; c < channels; c++)
+                {
+                    Array.Clear(spec[c], 0, half);
+                    VFloor1 fl = floors[mp.SubFloor[mp.Mux[c]]];
+                    hasFloor[c] = fl.Decode(pr, books, floorCurve[c], half);
+                    noRes[c] = !hasFloor[c];
+                }
+                for (int s = 0; s < mp.Mag.Length; s++)
+                {
+                    if (!noRes[mp.Mag[s]] || !noRes[mp.Ang[s]]) { noRes[mp.Mag[s]] = false; noRes[mp.Ang[s]] = false; }
+                }
+                for (int sm = 0; sm < mp.Submaps; sm++)
+                {
+                    List<int> chans = new List<int>();
+                    for (int c = 0; c < channels; c++) if (mp.Mux[c] == sm) chans.Add(c);
+                    VResidue rs = res[mp.SubResidue[sm]];
+                    int cnt = chans.Count;
+                    bool[] skip = new bool[cnt];
+                    for (int i = 0; i < cnt; i++) skip[i] = noRes[chans[i]];
+                    if (rs.Type == 2)
+                    {
+                        bool all = true; for (int i = 0; i < cnt; i++) if (!skip[i]) all = false;
+                        if (all) continue;
+                        float[][] one = new float[1][];
+                        one[0] = new float[half * cnt];
+                        rs.Decode(pr, books, one, new bool[1], half * cnt);
+                        for (int i = 0; i < cnt; i++)
+                            for (int k = 0; k < half; k++) spec[chans[i]][k] = one[0][k * cnt + i];
+                    }
+                    else
+                    {
+                        float[][] vv = new float[cnt][];
+                        for (int i = 0; i < cnt; i++) vv[i] = spec[chans[i]];
+                        rs.Decode(pr, books, vv, skip, half);
+                    }
+                }
+                for (int s = mp.Mag.Length - 1; s >= 0; s--)
+                {
+                    float[] M = spec[mp.Mag[s]], A = spec[mp.Ang[s]];
+                    for (int k = 0; k < half; k++)
+                    {
+                        float m = M[k], a = A[k], nm2, na;
+                        if (m > 0) { if (a > 0) { nm2 = m; na = m - a; } else { na = m; nm2 = m + a; } }
+                        else { if (a > 0) { nm2 = m; na = m + a; } else { na = m; nm2 = m - a; } }
+                        M[k] = nm2; A[k] = na;
+                    }
+                }
+
+                VImdct im = mode.Long ? imdctL : imdctS;
+                // window boundaries
+                int lStart, lEnd, rStart, rEnd;
+                if (mode.Long && !prevLong) { lStart = n / 4 - bs0 / 4; lEnd = n / 4 + bs0 / 4; }
+                else { lStart = 0; lEnd = n / 2; }
+                if (mode.Long && !nextLong) { rStart = n * 3 / 4 - bs0 / 4; rEnd = n * 3 / 4 + bs0 / 4; }
+                else { rStart = n / 2; rEnd = n; }
+                float[] lw = (!mode.Long || !prevLong) ? winS : winL;
+                float[] rw = (!mode.Long || !nextLong) ? winS : winL;
+
+                for (int c = 0; c < channels; c++)
+                {
+                    if (noRes[c] && !hasFloor[c])
+                    {
+                        Array.Clear(cur[c], 0, n);
+                        continue;
+                    }
+                    float[] sp = spec[c];
+                    if (hasFloor[c]) for (int k = 0; k < half; k++) sp[k] *= floorCurve[c][k];
+                    else Array.Clear(sp, 0, half);
+                    im.Inverse(sp, cur[c], z);
+                    float[] o = cur[c];
+                    for (int i = 0; i < lStart; i++) o[i] = 0;
+                    for (int i = lStart; i < lEnd; i++) o[i] *= lw[i - lStart];
+                    for (int i = rStart; i < rEnd; i++) o[i] *= rw[rEnd - 1 - i];
+                    for (int i = rEnd; i < n; i++) o[i] = 0;
+                }
+
+                if (prev != null)
+                {
+                    int L = prevN / 4 + n / 4;
+                    int needed = L * channels * 2;
+                    if (needed > ob.Length) ob = new byte[needed];
+                    int w = 0;
+                    for (int t = 0; t < L; t++)
+                    {
+                        for (int c = 0; c < channels; c++)
+                        {
+                            float v = 0;
+                            int pi = prevN / 2 + t; if (pi < prevN) v += prev[c][pi];
+                            int ci = n / 2 - L + t; if (ci >= 0) v += cur[c][ci];
+                            int s16 = (int)Math.Round(v * 32768.0f);
+                            if (s16 > 32767) s16 = 32767; else if (s16 < -32768) s16 = -32768;
+                            ob[w++] = (byte)(s16 & 0xFF); ob[w++] = (byte)((s16 >> 8) & 0xFF);
+                        }
+                    }
+                    fout.Write(ob, 0, w);
+                    dataBytes += w;
+                }
+                // current becomes previous
+                if (prev == null) { prev = new float[channels][]; for (int c = 0; c < channels; c++) prev[c] = new float[bs1]; }
+                for (int c = 0; c < channels; c++) Array.Copy(cur[c], prev[c], n);
+                prevN = n;
+            }
+            // trim padding from the final block using the granule position of the last page
+            long frameBytes = channels * 2;
+            if (ogg.EosGranule >= 0 && ogg.EosGranule * frameBytes < dataBytes) dataBytes = ogg.EosGranule * frameBytes;
+            if (dataBytes == 0) return "no audio data decoded";
+            if (dataBytes > Int32.MaxValue) return "decoded audio is too large for in-memory playback";
+            fout.SetLength(dataBytes);
+            pcm = fout.ToArray(); outputChannels = channels; outputRate = rate;
+            return null;
+        }
+    }
+
+    // rising half of the Vorbis power-sine window, length = half window
+    private static float[] MakeSlope(int len)
+    {
+        float[] w = new float[len];
+        for (int i = 0; i < len; i++)
+        {
+            double s = Math.Sin((i + 0.5) / (2.0 * len) * Math.PI);
+            w[i] = (float)Math.Sin(Math.PI / 2 * s * s);
+        }
+        return w;
     }
 }
 '@
@@ -1179,6 +2169,38 @@ function Remove-NotifyIcon {
     if ($global:NotifyIcon) {
         try { $global:NotifyIcon.Visible = $false; $global:NotifyIcon.Dispose() } catch { }
         $global:NotifyIcon = $null
+    }
+}
+
+# ---------------------------------------------------------------------------
+# Codec hints and playback helpers
+# ---------------------------------------------------------------------------
+function Show-CodecHint {
+    param([string]$Ext)
+    if ($global:CodecHintShown) { return }
+    $hint = switch ($Ext) {
+        '.opus' { "Not currently supported" }
+        default { $null }
+    }
+    if ($hint) {
+        $global:CodecHintShown = $true
+        Write-Host "  $hint" -ForegroundColor Yellow
+    }
+}
+
+function Start-VideoPlayback {
+    param([string]$Path)
+    try {
+        $playPath = $Path
+        $ext = [System.IO.Path]::GetExtension($Path).ToLowerInvariant()
+        Show-CodecHint $ext
+        [NativeMfPlayer]::Start($playPath)
+    }
+    finally {
+        if (-not [string]::IsNullOrWhiteSpace($global:VideoTempDir) -and
+            (Test-Path -LiteralPath $global:VideoTempDir)) {
+            Remove-Item -LiteralPath $global:VideoTempDir -Recurse -Force -ErrorAction SilentlyContinue
+        }
     }
 }
 
@@ -1245,7 +2267,7 @@ function Start-VideoMode {
     try {
         $resolved = Resolve-MediaPath $videoInput $AllExt
         if (-not $resolved) { Write-Host "  Cancelled." -ForegroundColor DarkGray; return }
-        [NativeMfPlayer]::Start($resolved)
+        Start-VideoPlayback $resolved
     }
     catch { Write-Host "[VIDEO ERROR] $($_.Exception.Message)" -ForegroundColor Red }
 }
@@ -1315,6 +2337,7 @@ function Get-PlayablePath {
     param([string]$File)
 
     $ext = [System.IO.Path]::GetExtension($File).ToLowerInvariant()
+
     if ($ext -ne '.wav' -and $ext -ne '.mp3') { return $File }
 
     $prepared = Join-Path $global:TempAudioDir ([guid]::NewGuid().ToString('N') + $ext)
@@ -1525,10 +2548,12 @@ function Open-Navigator {
 }
 
 function Get-TrackDuration {
+    if ($global:Alias -eq 'DirectPCM') { return [long][DirectPcmAudioEngine]::GetDurationMilliseconds() }
     return [long][NativeMfAudioEngine]::GetDurationMilliseconds()
 }
 
 function Get-TrackPosition {
+    if ($global:Alias -eq 'DirectPCM') { return [long][DirectPcmAudioEngine]::GetPositionMilliseconds() }
     return [long][NativeMfAudioEngine]::GetPositionMilliseconds()
 }
 
@@ -1554,7 +2579,8 @@ function Show-Progress {
 
 function Set-PlayerVolume($vol, $quiet = $false) {
     $global:Volume = [math]::Max(0, [math]::Min(100, $vol))
-    [void][NativeMfAudioEngine]::SetVolume($global:Volume)
+    if ($global:Alias -eq 'DirectPCM') { [void][DirectPcmAudioEngine]::SetVolume($global:Volume) }
+    else { [void][NativeMfAudioEngine]::SetVolume($global:Volume) }
     if (-not $quiet) { Write-Host "`r  Volume: $global:Volume%   " -NoNewline }
 }
 
@@ -1563,6 +2589,69 @@ function Play-Current {
     $file = $global:Queue[$global:Index]
     Write-Host "`nNow playing: $(Split-Path $file -Leaf)" -ForegroundColor Cyan
     Show-Notification "Now Playing" (Split-Path $file -Leaf)
+
+    $ext = [System.IO.Path]::GetExtension($file).ToLowerInvariant()
+    if ($ext -eq '.wav') {
+        try {
+            if ([DirectPcmAudioEngine]::OpenWavFloat($file)) {
+                $global:Alias = 'DirectPCM'
+                $global:Paused = $false
+                $global:AudioHasPlayed = $true
+                $global:PlayStartedAt = [DateTime]::UtcNow
+                $global:ArrowSteps = 0
+                Update-KeyBuffer
+                $global:SeekEnabled = $true
+                Set-PlayerVolume $global:Volume $true
+                return
+            }
+        }
+        catch {
+            [DirectPcmAudioEngine]::Close()
+            # Fall through to the existing PCM-temp-WAV/MFPlay path if direct
+            # waveOut playback cannot be opened for this float WAV.
+        }
+    }
+
+    if ($ext -eq '.ogg' -or $ext -eq '.aiff' -or $ext -eq '.aif') {
+        try {
+            if ($ext -eq '.ogg') {
+                #Write-Host "  Decoding OGG Vorbis directly to memory..." -ForegroundColor DarkCyan
+                [DirectPcmAudioEngine]::Open($file)
+            } else {
+                #Write-Host "  Decoding AIFF directly to memory..." -ForegroundColor DarkCyan
+                [DirectPcmAudioEngine]::OpenAiff($file)
+            }
+            $global:Alias = 'DirectPCM'
+            $global:Paused = $false
+            $global:AudioHasPlayed = $true
+            $global:PlayStartedAt = [DateTime]::UtcNow
+            $global:ArrowSteps = 0
+            Update-KeyBuffer
+            $global:SeekEnabled = $true
+            Set-PlayerVolume $global:Volume $true
+        }
+        catch {
+            [DirectPcmAudioEngine]::Close()
+
+            try {
+                [NativeMfAudioEngine]::Open($file)
+                $global:Alias = 'MFPlayAudio'
+                $global:Paused = $false
+                $global:AudioHasPlayed = $false
+                $global:PlayStartedAt = [DateTime]::UtcNow
+                $global:ArrowSteps = 0
+                Update-KeyBuffer
+                $global:SeekEnabled = $true
+                Set-PlayerVolume $global:Volume $true
+            }
+            catch {
+                $global:Alias = $null
+                Write-Host "  Could not decode/play $ext`: $($_.Exception.Message)" -ForegroundColor Red
+                if ($ext -eq '.ogg') { Show-CodecHint 'a supported OGG Vorbis file' }
+            }
+        }
+        return
+    }
 
     $playPath = Get-PlayablePath $file
     try {
@@ -1588,6 +2677,7 @@ function Play-Current {
 
     $global:Paused = $false
     $global:AudioHasPlayed = $false
+    $global:PlayStartedAt = [DateTime]::UtcNow
     $global:ArrowSteps = 0
     Update-KeyBuffer
     $global:SeekEnabled = $true
@@ -1595,7 +2685,9 @@ function Play-Current {
 
 function Stop-Current {
     $global:SeekEnabled = $false
-    if ($global:Alias) {
+    if ($global:Alias -eq 'DirectPCM') {
+        [DirectPcmAudioEngine]::Stop(); [DirectPcmAudioEngine]::Close(); $global:Alias = $null
+    } elseif ($global:Alias) {
         try { [NativeMfAudioEngine]::Stop() } catch { }
         [NativeMfAudioEngine]::Close()
         $global:Alias = $null
@@ -1606,6 +2698,11 @@ function Stop-Current {
 function Toggle-Pause {
     if (-not $global:Alias) { return }
     try {
+        if ($global:Alias -eq 'DirectPCM') {
+            if ($global:Paused) { [DirectPcmAudioEngine]::Play(); $global:Paused = $false }
+            else { [DirectPcmAudioEngine]::Pause(); $global:Paused = $true }
+            return
+        }
         if ($global:Paused) {
             [NativeMfAudioEngine]::Play()
             $global:Paused = $false
@@ -1658,7 +2755,8 @@ function Seek-Relative {
     $position = Get-TrackPosition
     $target = [long][math]::Max(0, [math]::Min($duration, $position + $DeltaMs))
     try {
-        [NativeMfAudioEngine]::SetPositionMilliseconds($target)
+        if ($global:Alias -eq 'DirectPCM') { [DirectPcmAudioEngine]::SetPositionMilliseconds($target) }
+        else { [NativeMfAudioEngine]::SetPositionMilliseconds($target) }
         Show-Progress
     }
     catch { Write-Host "`n  Seek error: $($_.Exception.Message)" -ForegroundColor Red }
@@ -1694,7 +2792,10 @@ function Prev-Track {
 
 function Resume-IfWasPlaying($wasPlaying) {
     if ($wasPlaying) {
-        try { [NativeMfAudioEngine]::Play() } catch { }
+        try {
+            if ($global:Alias -eq 'DirectPCM') { [DirectPcmAudioEngine]::Play() }
+            else { [NativeMfAudioEngine]::Play() }
+        } catch { }
         $global:Paused = $false
     }
 }
@@ -1703,7 +2804,10 @@ function Search-And-Play {
     Write-Host ""
     $wasPlaying = (-not $global:Paused) -and $global:Alias
     if ($wasPlaying) {
-        try { [NativeMfAudioEngine]::Pause() } catch { }
+        try {
+            if ($global:Alias -eq 'DirectPCM') { [DirectPcmAudioEngine]::Pause() }
+            else { [NativeMfAudioEngine]::Pause() }
+        } catch { }
         $global:Paused = $true
     }
 
@@ -1863,6 +2967,7 @@ $global:LastPlayedIndex = 0
 $global:QueueOpen       = $false
 #$global:PreSearchFile   = $null
 $global:AudioHasPlayed  = $false
+$global:PlayStartedAt   = [DateTime]::UtcNow
 $global:ValidKeys = @('N','B','P','S','Q','L','R','F','OemPlus','OemMinus','X')
 
 # Seek state
@@ -1983,7 +3088,10 @@ while ($global:Running) {
     # Auto-next when song ends
     if (-not $global:WaitingForLoop -and $global:Alias) {
         $mediaState = 0
-        try { $mediaState = [NativeMfAudioEngine]::GetState() } catch { }
+        try {
+            if ($global:Alias -eq 'DirectPCM') { $mediaState = [DirectPcmAudioEngine]::GetState() }
+            else { $mediaState = [NativeMfAudioEngine]::GetState() }
+        } catch { }
 
         if ($mediaState -eq 2 -and -not $global:AudioHasPlayed) {
             $global:AudioHasPlayed = $true
@@ -1991,10 +3099,19 @@ while ($global:Running) {
             Set-PlayerVolume $global:Volume $true
         }
 
-        if ($mediaState -eq 1 -and $global:AudioHasPlayed -and -not $global:Paused) {
+        $loadFailed = $false
+        if (-not $global:AudioHasPlayed -and -not $global:Paused -and $mediaState -ne 2 -and
+            ([DateTime]::UtcNow - $global:PlayStartedAt).TotalSeconds -gt 8) {
+            $loadFailed = $true
+            $failedFile = $global:Queue[$global:Index]
+            Write-Host "`n  Could not play '$(Split-Path $failedFile -Leaf)'. Skipping." -ForegroundColor Red
+            Show-CodecHint ([System.IO.Path]::GetExtension($failedFile).ToLowerInvariant())
+        }
+
+        if ($loadFailed -or ($mediaState -eq 1 -and $global:AudioHasPlayed -and -not $global:Paused)) {
             $global:SeekEnabled = $false
 
-            if ($global:RepeatOne) {
+            if ($global:RepeatOne -and -not $loadFailed) {
                 $global:LastPlayedIndex = $global:Index
                 Stop-Current
                 Play-Current
@@ -2047,7 +3164,7 @@ function Invoke-DirectPlay {
             Start-AudioMode
         }
         else {
-            [NativeMfPlayer]::Start($path)
+            Start-VideoPlayback $path
         }
     }
     catch { Write-Host "[ERROR] $($_.Exception.Message)" -ForegroundColor Red }
@@ -2065,7 +3182,7 @@ try {
         Write-Host "====================================" -ForegroundColor DarkCyan
         Write-Host "   WINDOWS PS1 MEDIA PLAYER CLI" -ForegroundColor Cyan
         Write-Host "====================================" -ForegroundColor DarkCyan
-        Write-Host "  1. Audio  (MP3 / WAV / FLAC / M4A / AAC / WMA)"
+        Write-Host "  1. Audio  (MP3 / WAV / FLAC / M4A / AAC / WMA / OGG / AIFF / AIF)"
         Write-Host "  2. Video  (GUI window; also opens any audio file)"
         Write-Host "  0. Exit"
         Write-Host ""
