@@ -1861,7 +1861,7 @@ $global:PreSearchIndex  = 0
 $global:CursorIndex     = 0
 $global:LastPlayedIndex = 0
 $global:QueueOpen       = $false
-$global:PreSearchFile   = $null
+#$global:PreSearchFile   = $null
 $global:AudioHasPlayed  = $false
 $global:ValidKeys = @('N','B','P','S','Q','L','R','F','OemPlus','OemMinus','X')
 
