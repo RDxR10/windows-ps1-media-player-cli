@@ -20,8 +20,8 @@ Drop the script in your media directory.
 ```powershell
 
 powershell -ep bypass -f .\play.ps1              
-powershell -ep bypass -f .\play.ps1 <filename.ext>  
-powershell -ep bypass -f .\play.ps1 <path to filename.ext>  
+powershell -ep bypass -f .\play.ps1 'filename.ext'  
+powershell -ep bypass -f .\play.ps1 'path to filename.ext'  
 ```
 
 ## Features
