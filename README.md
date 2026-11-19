@@ -1,15 +1,16 @@
 # Windows PS1 Media Player CLI
 
-Most of us don’t like clicking buttons over and over again, especially on Windows when listening to music; sometimes we just want that Linux-like experience. This CLI application serves that purpose.
+A lightweight command-line audio and video player for Windows. Just one script for playback. No installation required.
 
-Get your playlist shuffled and switch tracks with ease... enjoy your favorite music - uninterrupted and ad-free.
+## Who is this for?
 
-Best suited for those who have a regular music playlist/library and prefer the flexibility to change songs on the fly.
+This is for you if you:
 
-**Originally built as a CLI music player, it now also supports video playback, bringing both music and video under one interface.**
-
-> [!WARNING]
-> This repository does not encourage playing songs in corporate environments. Use at your own risk.
+* Are a Windows user by default.
+* Prefer a simple "all-in-one" setup without having to install additional software. 
+* Like having your personal media library available offline, with the flexibility to switch tracks and videos whenever needed.
+* Hate clicking buttons over and over.
+* Are fed up with ads interrupting audio and video content, or simply frustrated with streaming services (even after paying for a subscription).
 
 ## Setup
 
