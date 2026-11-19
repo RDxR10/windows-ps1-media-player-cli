@@ -6,7 +6,7 @@ A lightweight command-line audio and video player for Windows. Just one script f
 
 This is for you if you:
 
-* Are a Windows user by default.
+* Are a Windows user.
 * Prefer a simple "all-in-one" setup without having to install additional software. 
 * Like having your personal media library available offline, with the flexibility to switch tracks and videos whenever needed.
 * Hate clicking buttons over and over.
