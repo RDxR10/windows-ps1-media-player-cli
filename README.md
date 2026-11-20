@@ -73,3 +73,5 @@ powershell -ep bypass -f .\play.ps1 'path to filename.ext'
 * 15-11-2026 [FEAT]: Major rewrite: The music player has been extended into a media player, while retaining all existing music playback functionality and controls. The menu has also been reorganized into separate music and video sections. Windows Core Audio volume control has been dropped.
 
 * 18-11-2026 [FEAT]: Playback support has been added for OGG Vorbis and AIFF/AIF files. Playback compatibility may vary depending on the file's encoding and audio format. Supported audio is decoded into PCM in memory for direct playback, without creating converted audio files or modifying the original files. Temporary copies may be created only to remove extraneous data before the actual audio content.
+
+* 20-11-2026 [FEAT]: Playback support has been added for AIFC files. 
