@@ -435,6 +435,28 @@ Test-Case 'Extension lists are disjoint and AllExt is their union' {
     Assert-Equal ($AudioExt.Count + $VideoExt.Count) $AllExt.Count
     foreach ($e in ($AudioExt + $VideoExt)) { Assert-True ($e.StartsWith('.') -and $e -ceq $e.ToLowerInvariant()) "bad extension entry: $e" }
 }
+Test-Case 'AIFC: .aifc is included in audio discovery' {
+    Assert-True ($AudioExt -contains '.aifc') '.aifc is missing from $AudioExt'
+}
+Test-Case 'AIFC: Play-Current routes .aifc to DirectPCM OpenAiff' {
+    $playCurrentAst = Get-FunctionAst 'Play-Current'
+    Assert-True ($null -ne $playCurrentAst) 'Play-Current function not found'
+    $playCurrentText = $playCurrentAst.Extent.Text
+    Assert-True ($playCurrentText -match '(?i)\.aifc') '.aifc extension is not checked in Play-Current'
+    Assert-True ($playCurrentText -match '(?i)\[DirectPcmAudioEngine\]::OpenAiff\s*\(') 'Play-Current does not call DirectPcmAudioEngine.OpenAiff'
+    Assert-True ($playCurrentText -match '(?i)\.aifc') 'AIFC extension check missing'
+    Assert-True ($playCurrentText -match '(?i)\.aiff?c?') 'AIFF/AIFC extension routing is missing'
+}
+Test-Case 'AIFC: embedded decoder contains the supported compression identifiers' {
+    foreach ($code in 'NONE', 'twos', 'sowt', 'raw ', 'in24', 'in32', 'fl32', 'FL32', 'fl64', 'FL64', 'ulaw', 'ULAW', 'alaw', 'ALAW', 'ima4') {
+        Assert-True ($csSource.Contains($code)) "missing compression identifier: '$code'"
+    }
+}
+Test-Case 'AIFC: decoder validates FORM, COMM and SSND chunks' {
+    foreach ($token in 'FORM', 'COMM', 'SSND', 'FVER') {
+        Assert-True ($csSource.Contains($token)) "missing container handling token: $token"
+    }
+}
 Test-Case 'Get-MediaFiles: finds files by extension, recursively and case-insensitively' {
     $d = New-Fixture 'media1'
     foreach ($f in 'a.mp3', 'B.WAV', 'c.flac', 'd.mp4', 'e.txt', 'sub\f.m4a', 'sub\deeper\g.MKV') { Touch (Join-Path $d $f) }
@@ -1261,20 +1283,17 @@ else {
 		Assert-Equal $null $global:Alias
 		Assert-False $global:Paused
 	}
-	if ($testExt -eq '.ogg') {
-		T 'Play-Current: DirectPCM open failure falls back to original OGG' {
-			Use-Real 'Play-Current'; Use-Real 'Stop-Current'
-
-			$global:Queue = @($testFixture)
-			[DirectPcmAudioEngine]::FailNextOpens = 1
-
-			Play-Current
-
-			Need ([NativeMfAudioEngine]::OpenedPath -eq $testFixture) 'MFPlay did not receive the original OGG'
-			Need ($global:Alias -eq 'MFPlayAudio') 'MFPlay fallback was not activated'
-
-			Stop-Current
-		}
+	Test-Case 'Play-Current (real): DirectPCM decode failure falls back to MFPlay for OGG' {
+		Use-Real 'Play-Current'; Use-Real 'Stop-Current'
+		$fakeOgg = Join-Path $script:Tmp 'fallback_test.ogg'
+		[System.IO.File]::WriteAllBytes($fakeOgg, [byte[]](0,0,0,0))
+		$global:Queue = @($fakeOgg)
+		$global:Index = 0
+ 	
+		Play-Current
+		Assert-Equal $fakeOgg ([NativeMfAudioEngine]::OpenedPath) 'MFPlay did not receive the original OGG'
+		Assert-Equal 'MFPlayAudio' $global:Alias 'MFPlay fallback was not activated'
+		Stop-Current
 	}	
     Test-Case 'Play-Current (real): unsupported float WAV falls back to the original' {
         Use-Real 'Play-Current'; Use-Real 'Stop-Current'
@@ -1487,6 +1506,110 @@ function New-SineWav {
     $f.AddRange($data.ToArray())
     [System.IO.File]::WriteAllBytes($Path, $f.ToArray())
 }
+function Add-BE16 { param($L, [int]$V) $L.Add([byte](($V -shr 8) -band 255)); $L.Add([byte]($V -band 255)) }
+function Add-BE32 { param($L, [long]$V) for ($k = 3; $k -ge 0; $k--) { $L.Add([byte](($V -shr (8 * $k)) -band 255)) } }
+function Add-ASCII { param($L, [string]$V) $L.AddRange([Text.Encoding]::ASCII.GetBytes($V)) }
+function New-AifcFixture {
+    param(
+        [string]$Path,
+        [string]$Code = 'NONE',
+        [int]$Bits = 16,
+        [int]$Channels = 1,
+        [int]$Frames = 8000,
+        [int]$Rate = 8000,
+        [switch]$NoFver,
+        [switch]$BadFver,
+        [switch]$BadNameLength,
+        [switch]$BadSsndOffset,
+        [switch]$TruncateData,
+        [switch]$TruncateContainer,
+        [switch]$NoComm,
+        [switch]$NoSsnd,
+        [switch]$BadRate,
+        [switch]$OddJunkChunk
+    )
+    $payload = New-Object 'System.Collections.Generic.List[byte]'
+    $containerBits = if ($Code -eq 'ima4') { 16 } else { $Bits }
+    switch ($Code) {
+        { $_ -in 'NONE','twos' } {
+            for ($i = 0; $i -lt ($Frames * $Channels); $i++) {
+                $sample = [int](12000 * [Math]::Sin(2 * [Math]::PI * 440 * $i / $Rate))
+                if ($Bits -eq 12) { $sample = $sample -band 0xFFF0 }
+                Add-BE16 $payload $sample
+            }
+            break
+        }
+        'sowt' {
+            for ($i = 0; $i -lt ($Frames * $Channels); $i++) { $b = [BitConverter]::GetBytes([int16](12000 * [Math]::Sin(2 * [Math]::PI * 440 * $i / $Rate))); $payload.AddRange([byte[]]$b) }
+            break
+        }
+        'raw ' { for ($i = 0; $i -lt ($Frames * $Channels); $i++) { $payload.Add([byte](128 + (40 * [Math]::Sin(2 * [Math]::PI * 440 * $i / $Rate)))) }; break }
+        { $_ -in 'in24','42ni' } { for ($i = 0; $i -lt ($Frames * $Channels); $i++) { $v = [int](3000000 * [Math]::Sin(2 * [Math]::PI * 440 * $i / $Rate)); if ($Code -eq '42ni') { $payload.Add([byte]($v -band 255)); $payload.Add([byte](($v -shr 8) -band 255)); $payload.Add([byte](($v -shr 16) -band 255)) } else { $payload.Add([byte](($v -shr 16) -band 255)); $payload.Add([byte](($v -shr 8) -band 255)); $payload.Add([byte]($v -band 255)) } }; break }
+        { $_ -in 'in32','23ni' } { for ($i = 0; $i -lt ($Frames * $Channels); $i++) { $v = [int]([int64](1000000000 * [Math]::Sin(2 * [Math]::PI * 440 * $i / $Rate))); if ($Code -eq '23ni') { for ($k = 0; $k -lt 4; $k++) { $payload.Add([byte](($v -shr (8 * $k)) -band 255)) } } else { for ($k = 3; $k -ge 0; $k--) { $payload.Add([byte](($v -shr (8 * $k)) -band 255)) } } }; break }
+        { $_ -in 'fl32','FL32','fl64','FL64' } {
+            for ($i = 0; $i -lt ($Frames * $Channels); $i++) {
+                $v = [Math]::Sin(2 * [Math]::PI * 440 * $i / $Rate) * 0.4
+                $b = if ($Bits -eq 64) { [BitConverter]::GetBytes([double]$v) } else { [BitConverter]::GetBytes([single]$v) }
+                if ([BitConverter]::IsLittleEndian) { [Array]::Reverse($b) }
+                $payload.AddRange([byte[]]$b)
+            }
+            break
+        }
+        { $_ -in 'ulaw','ULAW' } { for ($i = 0; $i -lt ($Frames * $Channels); $i++) { $payload.Add([byte]0xFF) }; break }
+        { $_ -in 'alaw','ALAW' } { for ($i = 0; $i -lt ($Frames * $Channels); $i++) { $payload.Add([byte]0xD5) }; break }
+        'ima4' {
+            $packetCount = [int][Math]::Ceiling($Frames / 64.0)
+            for ($p = 0; $p -lt $packetCount; $p++) {
+                for ($ch = 0; $ch -lt $Channels; $ch++) {
+                    Add-BE16 $payload 0
+                    for ($j = 0; $j -lt 32; $j++) { $payload.Add([byte]0) }
+                }
+            }
+            break
+        }
+        default { throw "No fixture encoder for AIFC compression '$Code'" }
+    }
+    if ($TruncateData -and $payload.Count -gt 4) { $payload.RemoveRange($payload.Count - 4, 4) }
+
+    $form = New-Object 'System.Collections.Generic.List[byte]'
+    Add-ASCII $form 'FORM'; Add-BE32 $form 0; Add-ASCII $form 'AIFC'
+    if (-not $NoFver) {
+        Add-ASCII $form 'FVER'; Add-BE32 $form 4
+        Add-BE32 $form $(if ($BadFver) { 0x01020304 } else { 0xA2805140 })
+    }
+    if ($OddJunkChunk) { Add-ASCII $form 'JUNK'; Add-BE32 $form 1; $form.Add([byte]0x7F); $form.Add([byte]0) }
+    $comm = New-Object 'System.Collections.Generic.List[byte]'
+    Add-BE16 $comm $Channels; Add-BE32 $comm $Frames; Add-BE16 $comm $Bits
+    # 80-bit extended float encodings for the rates used by this fixture set.
+    if ($BadRate) { $comm.AddRange([byte[]](0,0,0,0,0,0,0,0,0,0)) }
+    elseif ($Rate -eq 44100) { $comm.AddRange([byte[]](0x40,0x0E,0xAC,0x44,0,0,0,0,0,0)) }
+    else { $comm.AddRange([byte[]](0x40,0x0B,0xFA,0,0,0,0,0,0,0)) }
+    Add-ASCII $comm $Code
+    $name = [Text.Encoding]::ASCII.GetBytes('test')
+    $nameLength = if ($BadNameLength) { 250 } else { $name.Length }
+    $comm.Add([byte]$nameLength); $comm.AddRange($name)
+    if ((1 + $name.Length) % 2 -ne 0) { $comm.Add([byte]0) }
+    if (-not $NoComm) {
+        Add-ASCII $form 'COMM'; Add-BE32 $form $comm.Count; $form.AddRange($comm)
+        if (($comm.Count % 2) -ne 0) { $form.Add([byte]0) }
+    }
+    $ssnd = New-Object 'System.Collections.Generic.List[byte]'
+    Add-BE32 $ssnd $(if ($BadSsndOffset) { 0x7FFFFFFF } else { 0 })
+    Add-BE32 $ssnd 0
+    $ssnd.AddRange($payload)
+    if (-not $NoSsnd) {
+        Add-ASCII $form 'SSND'; Add-BE32 $form $ssnd.Count; $form.AddRange($ssnd)
+        if (($ssnd.Count % 2) -ne 0) { $form.Add([byte]0) }
+    }
+    $formSize = $form.Count - 8
+    $form[4] = [byte](($formSize -shr 24) -band 255)
+    $form[5] = [byte](($formSize -shr 16) -band 255)
+    $form[6] = [byte](($formSize -shr 8) -band 255)
+    $form[7] = [byte]($formSize -band 255)
+    $bytes = $form.ToArray()
+    if ($TruncateContainer -and $bytes.Length -gt 5) { $bytes = $bytes[0..($bytes.Length - 6)] }
+    [IO.File]::WriteAllBytes($Path, $bytes)
+}
 function Pump { param([int]$Ms) $sw = [Diagnostics.Stopwatch]::StartNew(); while ($sw.ElapsedMilliseconds -lt $Ms) { [System.Windows.Forms.Application]::DoEvents(); Start-Sleep -Milliseconds 20 } }
 function Wait-State { param([int]$State, [int]$TimeoutMs = 6000)
     $sw = [Diagnostics.Stopwatch]::StartNew()
@@ -1624,6 +1747,126 @@ try {
         }
     }
     [NativeMfAudioEngine]::Close()
+
+    # ---- AIFF-C decoder verification: codec coverage, chunk parsing and rejection paths ----
+    $aifcCases = @(
+        @{ Code='NONE'; Bits=16; Name='uncompressed big-endian PCM' },
+        @{ Code='NONE'; Bits=16; Channels=2; Frames=44100; Rate=44100; Name='44.1 kHz stereo PCM' },
+        @{ Code='twos'; Bits=16; Name='twos big-endian PCM' },
+        @{ Code='sowt'; Bits=16; Name='sowt little-endian PCM' },
+        @{ Code='raw '; Bits=8; Name='unsigned 8-bit raw PCM' },
+        @{ Code='NONE'; Bits=12; Name='12-bit PCM in a 16-bit container' },
+        @{ Code='in24'; Bits=24; Name='24-bit PCM' },
+        @{ Code='42ni'; Bits=24; Name='reversed 24-bit PCM identifier' },
+        @{ Code='in32'; Bits=32; Name='32-bit PCM' },
+        @{ Code='23ni'; Bits=32; Name='reversed 32-bit PCM identifier' },
+        @{ Code='fl32'; Bits=32; Name='lowercase FL32 float' },
+        @{ Code='FL32'; Bits=32; Name='uppercase FL32 float' },
+        @{ Code='fl64'; Bits=64; Name='lowercase FL64 float' },
+        @{ Code='FL64'; Bits=64; Name='uppercase FL64 float' },
+        @{ Code='ulaw'; Bits=8; Name='G.711 mu-law' },
+        @{ Code='ULAW'; Bits=8; Name='uppercase G.711 mu-law' },
+        @{ Code='alaw'; Bits=8; Name='G.711 A-law' },
+        @{ Code='ALAW'; Bits=8; Name='uppercase G.711 A-law' },
+        @{ Code='ima4'; Bits=16; Name='IMA4 ADPCM' },
+        @{ Code='ima4'; Bits=16; Channels=2; Name='stereo IMA4 packet interleaving' }
+    )
+    foreach ($c in $aifcCases) {
+        $code = [string]$c.Code
+        $bits = [int]$c.Bits
+        $path = Join-Path $tmp ("aifc_" + ([BitConverter]::ToString([Text.Encoding]::ASCII.GetBytes($code)).Replace('-','')) + '.aifc')
+        try {
+            $channels = if ($c.ContainsKey('Channels')) { [int]$c.Channels } else { 1 }
+            $frames = if ($c.ContainsKey('Frames')) { [int]$c.Frames } else { 8000 }
+            $rate = if ($c.ContainsKey('Rate')) { [int]$c.Rate } else { 8000 }
+            New-AifcFixture -Path $path -Code $code -Bits $bits -Channels $channels -Frames $frames -Rate $rate
+            T "AIFC codec: $($c.Name) ($code)" {
+                try {
+                    [DirectPcmAudioEngine]::OpenAiff($path)
+                    $duration = [DirectPcmAudioEngine]::GetDurationMilliseconds()
+                    Need ($duration -ge 900 -and $duration -le 1100) "unexpected decoded duration: $duration ms"
+                    $p1 = [DirectPcmAudioEngine]::GetPositionMilliseconds()
+                    Pump 60
+                    $p2 = [DirectPcmAudioEngine]::GetPositionMilliseconds()
+                    Need ($p2 -gt $p1) "waveOut position did not advance ($p1 -> $p2)"
+                }
+                finally { [DirectPcmAudioEngine]::Close() }
+            }
+        }
+        catch { Report 'FAIL' "AIFC fixture: $code" $_.Exception.Message }
+    }
+    foreach ($variant in @(
+        @{ Name='valid FVER omitted (compatibility mode)'; Args=@{ NoFver=$true }; ShouldOpen=$true },
+        @{ Name='odd-sized unknown chunk and padding'; Args=@{ OddJunkChunk=$true }; ShouldOpen=$true },
+        @{ Name='unsupported FVER version'; Args=@{ BadFver=$true }; ShouldOpen=$false },
+        @{ Name='invalid Pascal compression-name length'; Args=@{ BadNameLength=$true }; ShouldOpen=$false },
+        @{ Name='SSND offset beyond available data'; Args=@{ BadSsndOffset=$true }; ShouldOpen=$false },
+        @{ Name='COMM chunk missing'; Args=@{ NoComm=$true }; ShouldOpen=$false },
+        @{ Name='SSND chunk missing'; Args=@{ NoSsnd=$true }; ShouldOpen=$false },
+        @{ Name='invalid zero sample rate'; Args=@{ BadRate=$true }; ShouldOpen=$false },
+        @{ Name='container truncated before declared FORM end'; Args=@{ TruncateContainer=$true }; ShouldOpen=$false },
+        @{ Name='truncated compressed sample payload'; Args=@{ TruncateData=$true; Code='ima4'; Bits=16 }; ShouldOpen=$true }
+    )) {
+        $path = Join-Path $tmp ("aifc_validation_" + [guid]::NewGuid().ToString('N') + '.aifc')
+        $args = @{ Path=$path; Code='NONE'; Bits=16 }
+        foreach ($k in $variant.Args.Keys) { $args[$k] = $variant.Args[$k] }
+        New-AifcFixture @args
+        T "AIFC container: $($variant.Name)" {
+            $opened = $false
+            try {
+                [DirectPcmAudioEngine]::OpenAiff($path)
+                $opened = ([DirectPcmAudioEngine]::GetDurationMilliseconds() -gt 0)
+            }
+            catch { $opened = $false }
+            finally { [DirectPcmAudioEngine]::Close() }
+            Need ($opened -eq [bool]$variant.ShouldOpen) ("expected ShouldOpen={0}, actual={1}" -f $variant.ShouldOpen, $opened)
+        }
+    }
+    T 'AIFC DirectPCM controls: pause/resume, seek, volume and close' {
+        $controlPath = Join-Path $tmp 'aifc_controls.aifc'
+        New-AifcFixture -Path $controlPath -Code 'NONE' -Bits 16 -Frames 24000
+        try {
+            [DirectPcmAudioEngine]::OpenAiff($controlPath)
+            $duration = [DirectPcmAudioEngine]::GetDurationMilliseconds()
+            Need ($duration -ge 2900 -and $duration -le 3100) "duration was $duration ms"
+            [DirectPcmAudioEngine]::Pause()
+            $pausedAt = [DirectPcmAudioEngine]::GetPositionMilliseconds()
+            Pump 150
+            $pausedAfter = [DirectPcmAudioEngine]::GetPositionMilliseconds()
+            Need ([Math]::Abs($pausedAfter - $pausedAt) -lt 100) "position moved while paused ($pausedAt -> $pausedAfter)"
+            [DirectPcmAudioEngine]::Play()
+            Pump 100
+            Need ([DirectPcmAudioEngine]::GetPositionMilliseconds() -gt $pausedAfter) 'position did not advance after resume'
+            [DirectPcmAudioEngine]::SetPositionMilliseconds(1000)
+            Pump 80
+            $seek = [DirectPcmAudioEngine]::GetPositionMilliseconds()
+            Need ($seek -ge 800 -and $seek -le 1300) "seek position was $seek ms"
+            [DirectPcmAudioEngine]::SetVolume(50)
+            [DirectPcmAudioEngine]::SetVolume(100)
+        }
+        finally { [DirectPcmAudioEngine]::Close() }
+        Need ([DirectPcmAudioEngine]::GetDurationMilliseconds() -eq 0) 'engine did not reset after Close'
+    }
+    # Verify the actual application route, not just decoder availability.
+    T 'AIFC application route: .aifc uses DirectPCM OpenAiff without a temp conversion' {
+        $routePath = Join-Path $tmp 'route_test.aifc'
+        New-AifcFixture -Path $routePath -Code 'NONE' -Bits 16
+        $targetTokens = $null; $targetErrors = $null
+        $routeAst = [System.Management.Automation.Language.Parser]::ParseFile($TargetPath, [ref]$targetTokens, [ref]$targetErrors)
+        Need ($targetErrors.Count -eq 0) 'target script parse failed'
+        $routeFn = @($routeAst.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq 'Play-Current' }, $true))[0]
+        $routeText = $routeFn.Extent.Text
+        Need ($routeText -match '(?i)\.aifc') '.aifc extension check missing from Play-Current'
+        Need ($routeText -match '(?i)\[DirectPcmAudioEngine\]::OpenAiff\s*\(') 'DirectPcmAudioEngine.OpenAiff call missing from Play-Current'
+        # AIFC playback is decoded to in-memory PCM. It must not use the temporary
+        # conversion helpers used by other media paths.
+        $aifcAt = $routeText.IndexOf("'.aifc'", [StringComparison]::OrdinalIgnoreCase)
+        Need ($aifcAt -ge 0) 'Could not locate the .aifc route condition'
+        $openAiffAt = $routeText.IndexOf('OpenAiff', [StringComparison]::OrdinalIgnoreCase)
+        Need ($openAiffAt -ge 0) 'Could not locate OpenAiff call'
+        Need ($routeText -match '(?is)OpenAiff\s*\(\s*\$file\s*\)') 'OpenAiff is not called with the original media path'
+        Need ($routeText -notmatch '(?is)OpenAiff.{0,500}(Get-PlayablePath|ConvertToWav|TempAudioFile)') 'AIFC direct path appears to invoke a temp conversion helper'
+    }
 
     # ---- Real codec fixtures: automatically provision one file per audio extension ----
     foreach ($ext in $audioFixtureBase64.Keys) {
@@ -2087,3 +2330,4 @@ Say '----------------------------------------'
 
 if ($script:Failed -gt 0) { exit 1 }
 exit 0
+
