@@ -8,7 +8,7 @@ $ErrorActionPreference = 'Stop'
 $MusicDir = $PSScriptRoot
 if ([string]::IsNullOrWhiteSpace($MusicDir)) { $MusicDir = (Get-Location).Path }
 
-$AudioExt = @('.mp3', '.wav', '.flac', '.m4a', '.aac', '.wma', '.ogg', '.aiff', '.aif')
+$AudioExt = @('.mp3', '.wav', '.flac', '.m4a', '.aac', '.wma', '.ogg', '.aiff', '.aif', '.aifc')
 $VideoExt = @('.mp4', '.mkv', '.avi', '.mov', '.wmv', '.m4v')
 $AllExt   = $AudioExt + $VideoExt
 
@@ -1106,7 +1106,7 @@ public static class AudioDecoders
 
 }
 
-// Direct PCM playback for OGG Vorbis, supported AIFF files, and IEEE-float WAVs.
+// Direct PCM playback for OGG Vorbis, supported AIFF/AIFF-C files, and IEEE-float WAVs.
 // Audio is decoded or converted in memory and submitted to Windows waveOut.
 public static class DirectPcmAudioEngine
 {
@@ -1206,86 +1206,226 @@ public static class DirectPcmAudioEngine
 
 internal static class AiffDecoder
 {
-    private static uint BE32(byte[] b, int o) { return (uint)(b[o] << 24 | b[o + 1] << 16 | b[o + 2] << 8 | b[o + 3]); }
-    private static int BE16(byte[] b, int o) { return b[o] << 8 | b[o + 1]; }
+    [StructLayout(LayoutKind.Explicit)] private struct FloatBits { [FieldOffset(0)] public int I; [FieldOffset(0)] public float F; }
+    [StructLayout(LayoutKind.Explicit)] private struct DoubleBits { [FieldOffset(0)] public long I; [FieldOffset(0)] public double D; }
+    // The AIFF-C spec requires an FVER chunk (version 0xA2805140). An unsupported version is always rejected;
+    // set this to true to also reject AIFF-C files that omit FVER (some real-world writers do).
+    private const bool RequireFver = false;
+    private static float ReadFloat32(byte[] b, int o, bool little)
+    {
+        uint bits = 0;
+        if (little) { for (int j = 3; j >= 0; j--) bits = (bits << 8) | b[o + j]; }
+        else { for (int j = 0; j < 4; j++) bits = (bits << 8) | b[o + j]; }
+        FloatBits value = new FloatBits(); value.I = unchecked((int)bits); return value.F;
+    }
+    private static double ReadFloat64(byte[] b, int o, bool little)
+    {
+        ulong bits = 0;
+        if (little) { for (int j = 7; j >= 0; j--) bits = (bits << 8) | b[o + j]; }
+        else { for (int j = 0; j < 8; j++) bits = (bits << 8) | b[o + j]; }
+        DoubleBits value = new DoubleBits(); value.I = unchecked((long)bits); return value.D;
+    }
+    private static uint BE32(byte[] b, int o) { return ((uint)b[o] << 24) | ((uint)b[o + 1] << 16) | ((uint)b[o + 2] << 8) | b[o + 3]; }
+    private static int BE16(byte[] b, int o) { return (b[o] << 8) | b[o + 1]; }
+    private static int LE16(byte[] b, int o) { return b[o] | (b[o + 1] << 8); }
+    private static short Clamp16(int v) { return (short)(v < -32768 ? -32768 : (v > 32767 ? 32767 : v)); }
+    private static void Put16(byte[] dst, int index, short value)
+    {
+        dst[index] = (byte)(value & 255); dst[index + 1] = (byte)((value >> 8) & 255);
+    }
+    private static short DecodeMuLaw(byte value)
+    {
+        int u = (~value) & 255; int t = ((u & 15) << 3) + 132; t <<= (u >> 4) & 7;
+        return (short)(((u & 128) != 0) ? (132 - t) : (t - 132));
+    }
+    private static short DecodeALaw(byte value)
+    {
+        int a = value ^ 0x55; int t = (a & 15) << 4; int seg = (a & 0x70) >> 4;
+        if (seg == 0) t += 8; else if (seg == 1) t += 0x108; else { t += 0x108; t <<= seg - 1; }
+        return (short)(((a & 0x80) != 0) ? t : -t);
+    }
+    private static readonly int[] ImaStepTable = { 7,8,9,10,11,12,13,14,16,17,19,21,23,25,28,31,34,37,41,45,50,55,60,66,73,80,88,97,107,118,130,143,157,173,190,209,230,253,279,307,337,371,408,449,494,544,598,658,724,796,876,963,1060,1166,1282,1411,1552,1707,1878,2066,2272,2499,2749,3024,3327,3660,4026,4428,4871,5358,5894,6484,7132,7845,8630,9493,10442,11487,12635,13899,15289,16818,18500,20350,22385,24623,27086,29794,32767 };
+    private static readonly int[] ImaIndexTable = { -1,-1,-1,-1,2,4,6,8,-1,-1,-1,-1,2,4,6,8 };
+    private static int ImaNibble(int nibble, ref int predictor, ref int index)
+    {
+        int step = ImaStepTable[index]; int diff = step >> 3;
+        if ((nibble & 1) != 0) diff += step >> 2;
+        if ((nibble & 2) != 0) diff += step >> 1;
+        if ((nibble & 4) != 0) diff += step;
+        predictor += ((nibble & 8) != 0) ? -diff : diff;
+        if (predictor < -32768) predictor = -32768; else if (predictor > 32767) predictor = 32767;
+        index += ImaIndexTable[nibble & 15]; if (index < 0) index = 0; else if (index > 88) index = 88;
+        return predictor;
+    }
+    // QuickTime IMA4: every packet is 34 bytes per channel and holds 64 frames. The first two bytes are a
+    // big-endian header (9-bit predictor in the top bits, 7-bit step index), followed by 32 bytes of nibbles.
+    // QuickTime packs the FIRST sample of each byte in the LOW nibble and the second in the HIGH nibble.
+    // Channels are interleaved packet by packet. Truncated data decodes as far as it goes.
+    private static string DecodeIma4(byte[] f, int dataOff, int dataLen, int channels, long frames, out byte[] pcm)
+    {
+        pcm = null;
+        const int packetBytes = 34, packetFrames = 64;
+        long packetsAvailable = dataLen / ((long)packetBytes * channels);
+        if (packetsAvailable < 1) return "truncated AIFF-C ima4 packet data";
+        // Apple-written ima4 files store the number of 34-byte PACKETS in COMM; other writers store the number of
+        // sample frames. A packet count can never exceed the packets actually present, a sample count always does.
+        if (frames <= packetsAvailable) frames *= packetFrames;
+        long packetsWanted = (frames + packetFrames - 1) / packetFrames;
+        long packetsPerChannel = Math.Min(packetsWanted, packetsAvailable);
+        long decodableFrames = Math.Min(frames, packetsPerChannel * packetFrames);
+        long outputLength = decodableFrames * channels * 2;
+        if (outputLength <= 0 || outputLength > Int32.MaxValue) return "AIFF-C PCM data is empty or too large for in-memory playback";
+        pcm = new byte[(int)outputLength];
+        int outFrame = 0;
+        for (long packet = 0; packet < packetsPerChannel; packet++)
+        {
+            int thisFrames = (int)Math.Min(packetFrames, decodableFrames - outFrame);
+            for (int ch = 0; ch < channels; ch++)
+            {
+                int packetOffset = dataOff + (int)((packet * channels + ch) * packetBytes);
+                int header = BE16(f, packetOffset); int predictor = (short)(header & 0xFF80); int index = header & 0x7F;
+                if (index > 88) index = 88;
+                for (int j = 0; j < thisFrames; j++)
+                {
+                    int packed = f[packetOffset + 2 + (j >> 1)];
+                    int nibble = ((j & 1) == 0) ? (packed & 15) : (packed >> 4);
+                    short sample = (short)ImaNibble(nibble, ref predictor, ref index);
+                    Put16(pcm, ((outFrame + j) * channels + ch) * 2, sample);
+                }
+            }
+            outFrame += thisFrames;
+        }
+        return null;
+    }
 
     public static string Decode(string inPath, out byte[] pcm, out int channels, out int sampleRate)
     {
         pcm = null; channels = 0; sampleRate = 0;
         byte[] f = File.ReadAllBytes(inPath);
-        if (f.Length < 12 || Encoding.ASCII.GetString(f, 0, 4) != "FORM") return "not an AIFF file";
+        if (f.Length < 12 || Encoding.ASCII.GetString(f, 0, 4) != "FORM") return "not an AIFF/AIFF-C file";
         string form = Encoding.ASCII.GetString(f, 8, 4);
         bool aifc = form == "AIFC";
-        if (!aifc && form != "AIFF") return "not an AIFF file";
-
+        if (!aifc && form != "AIFF") return "not an AIFF/AIFF-C file";
+        uint formLength = BE32(f, 4);
+        if (formLength < 4 || (long)formLength + 8 > f.Length) return "invalid or truncated AIFF FORM length";
+        int formEnd = (int)(formLength + 8);
         int bits = 0, dataOff = -1, dataLen = 0;
-        long frames = 0; double rate = 0; bool littleEndian = false;
+        long frames = -1; double rate = 0; bool littleEndian = false;
+        string compression = "NONE"; bool commFound = false; bool fverFound = false;
         int pos = 12;
-        while (pos + 8 <= f.Length)
+        while (pos + 8 <= formEnd)
         {
             string id = Encoding.ASCII.GetString(f, pos, 4);
             uint chunkLength = BE32(f, pos + 4);
             if (chunkLength > Int32.MaxValue) return "AIFF chunk is too large";
-            int len = (int)chunkLength;
-            int body = pos + 8;
-            if (body > f.Length || len > f.Length - body) return "truncated AIFF chunk";
-            if (id == "COMM" && len >= 18)
+            int len = (int)chunkLength; int body = pos + 8;
+            if (body > formEnd || len > formEnd - body) return "truncated AIFF chunk";
+            if (id == "COMM")
             {
-                channels = BE16(f, body);
-                frames = BE32(f, body + 2);
-                bits = BE16(f, body + 6);
-                int exp = BE16(f, body + 8) & 0x7FFF;
-                ulong mant = ((ulong)BE32(f, body + 10) << 32) | BE32(f, body + 14);
-                rate = mant * Math.Pow(2, exp - 16383 - 63);
+                if (len < (aifc ? 23 : 18)) return "invalid AIFF COMM chunk";
+                channels = BE16(f, body); frames = BE32(f, body + 2); bits = BE16(f, body + 6);
+                int exp = BE16(f, body + 8); ulong mant = ((ulong)BE32(f, body + 10) << 32) | BE32(f, body + 14);
+                if ((exp & 0x7FFF) == 0 || mant == 0) return "invalid AIFF sample rate";
+                bool negative = (exp & 0x8000) != 0; int unbiased = (exp & 0x7FFF) - 16383;
+                rate = mant * Math.Pow(2.0, unbiased - 63); if (negative) rate = -rate;
                 if (aifc)
                 {
-                    if (len < 22) return "AIFF-C compression type is missing";
-                    string comp = Encoding.ASCII.GetString(f, body + 18, 4);
-                    if (comp == "sowt") littleEndian = true;
-                    else if (comp != "NONE" && comp != "twos") return "compressed AIFF-C (" + comp + ") is not supported";
+                    compression = Encoding.ASCII.GetString(f, body + 18, 4);
+                    // compressionName is a Pascal string (length byte + text) that must fit inside the chunk.
+                    int nameLen = f[body + 22];
+                    if (23 + nameLen > len) return "invalid AIFF-C COMM compression name";
+                }
+                commFound = true;
+            }
+            else if (id == "FVER")
+            {
+                if (!aifc) { /* FVER is only defined for AIFF-C; ignore it elsewhere */ }
+                else
+                {
+                    if (len != 4) return "invalid AIFF-C FVER chunk";
+                    if (BE32(f, body) != 0xA2805140u) return "unsupported AIFF-C format version";
+                    fverFound = true;
                 }
             }
-            else if (id == "SSND" && len >= 8)
+            else if (id == "SSND")
             {
+                if (len < 8) return "invalid AIFF SSND chunk";
                 uint offset = BE32(f, body);
                 if (offset > (uint)(len - 8)) return "invalid AIFF sound-data offset";
-                dataOff = body + 8 + (int)offset;
-                dataLen = len - 8 - (int)offset;
+                dataOff = body + 8 + (int)offset; dataLen = len - 8 - (int)offset;
             }
             long next = (long)body + len + (len & 1);
-            if (next > f.Length) return "truncated AIFF chunk padding";
+            if (next > formEnd) return "truncated AIFF chunk padding";
             pos = (int)next;
         }
-        if (channels < 1 || channels > 2 || dataOff < 0 || bits < 8 || bits > 32 || rate < 1 || rate > 384000)
-            return "unsupported AIFF layout (requires mono/stereo integer PCM, 8-32 bits)";
+        if (!commFound || dataOff < 0) return "AIFF is missing COMM or SSND data";
+        if (aifc && RequireFver && !fverFound) return "AIFF-C file is missing the required FVER chunk";
+        if (channels < 1 || channels > 2 || frames < 1 || rate < 1 || rate > 384000) return "unsupported AIFF layout (requires mono/stereo and a valid sample rate)";
+        sampleRate = (int)Math.Round(rate);
+        if (sampleRate < 1) return "invalid AIFF sample rate";
+        if (compression == "ima4") return DecodeIma4(f, dataOff, dataLen, channels, frames, out pcm);
+
+        // Compression identifiers. Float: fl32/FL32/fl64/FL64 are ALL big-endian (the case only differs by writer).
+        bool isFloat = compression == "fl32" || compression == "FL32" || compression == "fl64" || compression == "FL64";
+        bool isMuLaw = compression == "ulaw" || compression == "ULAW";
+        bool isALaw = compression == "alaw" || compression == "ALAW";
+        bool isUnsigned8 = compression == "raw ";            // offset-binary unsigned 8-bit PCM
+        bool isIn24 = compression == "in24" || compression == "42ni";   // 24-bit integer PCM (big / little endian)
+        bool isIn32 = compression == "in32" || compression == "23ni";   // 32-bit integer PCM (big / little endian)
+        bool isIntPcm = compression == "NONE" || compression == "twos" || compression == "sowt" || isUnsigned8 || isIn24 || isIn32;
+        // Little-endian integer PCM: sowt, plus the byte-swapped identifiers 42ni (in24) and 23ni (in32).
+        if (compression == "sowt" || compression == "42ni" || compression == "23ni") littleEndian = true;
+        if (!isIntPcm && !isFloat && !isMuLaw && !isALaw)
+            return "AIFF-C compression type '" + compression + "' is not supported";
+        if (isMuLaw || isALaw || isUnsigned8) bits = 8;
+        if (isIn24) bits = 24;
+        if (isIn32) bits = 32;
+        if (isFloat) bits = compression.EndsWith("64") ? 64 : 32;
+        if (!isFloat && (bits < 1 || bits > 32))
+            return "unsupported AIFF sample format (integer PCM: 1-32 bits; float: 32/64-bit)";
+        // AIFF stores each sample left-justified in a whole number of bytes, so e.g. 12-bit samples use
+        // 2 bytes and 20-bit samples use 3 bytes, with the unused low bits zero.
         int bytesPerSample = (bits + 7) / 8;
-        long sampleCount = (long)dataLen / bytesPerSample;
-        long frameCount = sampleCount / channels;
-        if (frames > 0) frameCount = Math.Min(frameCount, frames);
+        int containerBits = bytesPerSample * 8;
+        long availableFrames = dataLen / (long)(bytesPerSample * channels);
+        long frameCount = Math.Min(frames, availableFrames);
         long outputBytes = frameCount * channels * 2;
         if (outputBytes <= 0 || outputBytes > Int32.MaxValue) return "AIFF PCM data is empty or too large for in-memory playback";
         pcm = new byte[(int)outputBytes];
-        int count = (int)(frameCount * channels);
-        for (int i = 0; i < count; i++)
+        int samples = (int)(frameCount * channels);
+        for (int i = 0; i < samples; i++)
         {
-            int o = dataOff + i * bytesPerSample;
-            short sample;
-            if (littleEndian)
+            int o = dataOff + i * bytesPerSample; short value;
+            if (isMuLaw) value = DecodeMuLaw(f[o]);
+            else if (isALaw) value = DecodeALaw(f[o]);
+            else if (isFloat)
             {
-                int hi = f[o + bytesPerSample - 1];
-                int lo = bytesPerSample > 1 ? f[o + bytesPerSample - 2] : 0;
-                sample = unchecked((short)((hi << 8) | lo));
+                double v;
+                if (bits == 32) v = ReadFloat32(f, o, false);
+                else v = ReadFloat64(f, o, false);
+                if (Double.IsNaN(v)) v = 0; else if (v > 1.0) v = 1.0; else if (v < -1.0) v = -1.0;
+                value = Clamp16((int)Math.Round(v < 0 ? v * 32768.0 : v * 32767.0));
             }
-            else if (bytesPerSample == 1) sample = unchecked((short)((sbyte)f[o] << 8));
-            else sample = unchecked((short)((f[o] << 8) | f[o + 1]));
-            pcm[i * 2] = (byte)(sample & 0xFF);
-            pcm[i * 2 + 1] = (byte)((sample >> 8) & 0xFF);
+            else if (isUnsigned8)
+            {
+                value = Clamp16((f[o] - 128) << 8);
+            }
+            else
+            {
+                long raw = 0;
+                if (littleEndian) { for (int j = bytesPerSample - 1; j >= 0; j--) raw = (raw << 8) | f[o + j]; }
+                else { for (int j = 0; j < bytesPerSample; j++) raw = (raw << 8) | f[o + j]; }
+                int shift = 64 - containerBits; long sv = (raw << shift) >> shift;       // sign-extend the whole container
+                if (bits < containerBits) sv &= ~((1L << (containerBits - bits)) - 1);   // ignore the padding bits
+                if (containerBits > 16) { int down = containerBits - 16; sv = (sv + (1L << (down - 1))) >> down; }   // round to 16-bit
+                else sv <<= (16 - containerBits);
+                value = Clamp16((int)sv);
+            }
+            Put16(pcm, i * 2, value);
         }
-        sampleRate = (int)Math.Round(rate);
         return null;
     }
 }
-
 internal class VorbisException : Exception
 {
     public VorbisException(string m) : base(m) { }
@@ -2612,7 +2752,7 @@ function Play-Current {
         }
     }
 
-    if ($ext -eq '.ogg' -or $ext -eq '.aiff' -or $ext -eq '.aif') {
+    if ($ext -eq '.ogg' -or $ext -eq '.aiff' -or $ext -eq '.aif' -or $ext -eq '.aifc') {
         try {
             if ($ext -eq '.ogg') {
                 #Write-Host "  Decoding OGG Vorbis directly to memory..." -ForegroundColor DarkCyan
@@ -3182,7 +3322,7 @@ try {
         Write-Host "====================================" -ForegroundColor DarkCyan
         Write-Host "   WINDOWS PS1 MEDIA PLAYER CLI" -ForegroundColor Cyan
         Write-Host "====================================" -ForegroundColor DarkCyan
-        Write-Host "  1. Audio  (MP3 / WAV / FLAC / M4A / AAC / WMA / OGG / AIFF / AIF)"
+        Write-Host "  1. Audio  (MP3 / WAV / FLAC / M4A / AAC / WMA / OGG / AIFF / AIF / AIFC)"
         Write-Host "  2. Video  (GUI window; also opens any audio file)"
         Write-Host "  0. Exit"
         Write-Host ""
@@ -3208,3 +3348,4 @@ try {
 finally {
     Remove-NotifyIcon
 }
+
